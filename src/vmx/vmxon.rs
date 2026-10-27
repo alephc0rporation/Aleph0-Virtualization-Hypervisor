@@ -82,6 +82,17 @@ impl VmxOperation {
         }
         Ok(())
     }
+
+    /// CR0 as it was before VMXON. The guest's read shadow takes the owned
+    /// bits from here, so the guest sees their pre-VMX values (`vmx::cr`).
+    pub fn original_cr0(&self) -> u64 {
+        self.original_cr0
+    }
+
+    /// CR4 as it was before VMXON, with CR4.VMXE clear.
+    pub fn original_cr4(&self) -> u64 {
+        self.original_cr4
+    }
 }
 
 /// Forces CR0 and CR4 into the ranges the CPU requires for VMX operation.

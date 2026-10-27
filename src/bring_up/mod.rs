@@ -67,6 +67,7 @@ use crate::vmx;
 use crate::vmx::VmxCapabilities;
 use crate::vmx::apic::{self, ApicBase, IA32_APIC_BASE, LapicMode};
 use crate::vmx::context_tables::{GdtError, GdtRegion, TssRegion};
+use crate::vmx::cr::{CrControls, CrFixed};
 use crate::vmx::ept::{self, Ept, EptSupport, TypeTables};
 use crate::vmx::exit_bitmaps::ExitBitmaps;
 use crate::vmx::guest::{GUEST_SCRATCH_PORT, GuestMemory};
@@ -222,6 +223,7 @@ pub fn run() -> Result<GuestRun, BringUpError> {
         vmx_operation,
         mtrrs,
         types,
+        cr_controls,
     } = entry;
 
     // From here on every path goes through teardown before returning.
@@ -233,6 +235,7 @@ pub fn run() -> Result<GuestRun, BringUpError> {
         // (check it is resident, hide it from the guest, publish the type
         // tables), then launch.
         Ok(_) => finalize_memory(mtrrs, types, &context_tables)
+            .and_then(|()| write_cr_shadowing(&cr_controls))
             .and_then(|()| launch_guest(&controls, &vmexit_stack, &guest, &ept, &host, &bitmaps, &context_tables)),
         Err(error) => Err(*error),
     };
@@ -269,6 +272,9 @@ struct VmxEntry {
     /// handler in `launch_guest` after `hide` runs.
     mtrrs: MtrrState,
     types: TypeTables,
+    /// The CR0/CR4 guest/host masks and read shadows, written to the VMCS in
+    /// `run` before the launch.
+    cr_controls: CrControls,
 }
 
 /// Steps 2 to 4 up to the VMCS: allocates the VM-exit stack and the guest's
@@ -367,6 +373,20 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
     let vmx_operation = unsafe { vmx::vmxon::enter_vmx_root_operation() }?;
     log!("Entered VMX root operation.");
 
+    // The guest's view of CR0/CR4: it owns only the bits VMX operation fixes,
+    // and reads their pre-VMX values (CR4.VMXE = 0) through the read shadows,
+    // while GUEST_CR0/CR4 keep the real ones. CR0/CR4 now hold the fixed bits
+    // VMXON set; `vmx_operation` kept the values from before it.
+    // SAFETY: VMX operation is active, so the FIXED MSRs exist.
+    let cr_fixed = unsafe { CrFixed::read() };
+    let cr_controls = CrControls::new(
+        cr_fixed,
+        vmx::cr::read_cr0(),
+        vmx::cr::read_cr4(),
+        vmx_operation.original_cr0(),
+        vmx_operation.original_cr4(),
+    );
+
     Ok(VmxEntry {
         vmexit_stack,
         guest,
@@ -378,6 +398,7 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
         vmx_operation,
         mtrrs,
         types,
+        cr_controls,
     })
 }
 
@@ -523,6 +544,17 @@ fn finalize_memory(
         hide_resident_memory(&mut types, mtrrs.mtrrs(), context_tables)?;
     }
     vmx::vmexit::publish_guest_mtrrs(mtrrs, types);
+    Ok(())
+}
+
+/// Writes the CR0/CR4 guest/host masks and read shadows to the current VMCS
+/// (`vmx::cr::CrControls`): the guest owns only the bits VMX operation fixes,
+/// and reads their pre-VMX values (CR4.VMXE = 0) through the shadows, while
+/// GUEST_CR0/CR4 keep the real ones. docs/CONTROL_REGISTERS.md.
+fn write_cr_shadowing(cr_controls: &CrControls) -> Result<(), BringUpError> {
+    // SAFETY: VMX root operation with the VMCS `run` created and made current.
+    unsafe { vmx::vmcs::configure_cr_shadowing(cr_controls) }.map_err(vmcs_step("CR mask/shadow setup"))?;
+    report::cr_controls(cr_controls);
     Ok(())
 }
 

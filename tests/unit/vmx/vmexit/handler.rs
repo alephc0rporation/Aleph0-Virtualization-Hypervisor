@@ -101,6 +101,40 @@ fn guest_mtrr_failures_say_what_went_wrong() {
 }
 
 #[test]
+fn a_cr_write_source_reads_every_register_including_rsp() {
+    // The frame holds each register's number as its value, so a correct
+    // decode returns the number; RSP (4) is not in the frame, it is GUEST_RSP.
+    let frame = RegisterFrame {
+        rax: 0,
+        rbx: 3,
+        rcx: 1,
+        rdx: 2,
+        rsi: 6,
+        rdi: 7,
+        rbp: 5,
+        r8: 8,
+        r9: 9,
+        r10: 10,
+        r11: 11,
+        r12: 12,
+        r13: 13,
+        r14: 14,
+        r15: 15,
+    };
+    let rsp = Some(Ok(4));
+    for number in 0u8..16 {
+        assert_eq!(
+            cr_source_value(number, &frame, rsp),
+            Some(u64::from(number)),
+            "register {number}"
+        );
+    }
+    // RSP as the source, but GUEST_RSP unreadable: no value.
+    assert_eq!(cr_source_value(4, &frame, Some(Err(VmcsError::VmFailValid))), None);
+    assert_eq!(cr_source_value(4, &frame, None), None);
+}
+
+#[test]
 fn the_guest_resumes_in_the_phase_the_exit_found() {
     for found in [Phase::BootServices, Phase::Runtime] {
         assert_eq!(resume_phase(ExitEvent::Halted, found), found);

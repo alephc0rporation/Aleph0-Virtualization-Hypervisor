@@ -617,6 +617,25 @@ pub unsafe fn set_nmi_window_exiting(on: bool) -> Result<(), VmcsError> {
     unsafe { vmwrite(PRIMARY_VM_EXEC_CONTROL, with_nmi_window_exiting(primary, on)) }
 }
 
+/// Writes the CR0/CR4 guest/host masks and read shadows, reading each back.
+/// With them the guest owns only the bits VMX operation fixes and reads their
+/// pre-VMX values (CR4.VMXE = 0) through the shadows, while GUEST_CR0/CR4 keep
+/// the real ones (`vmx::cr::CrControls`, docs/CONTROL_REGISTERS.md).
+///
+/// # Safety
+///
+/// VMX operation must be active and a VMCS current on this CPU.
+pub unsafe fn configure_cr_shadowing(controls: &cr::CrControls) -> Result<(), VmcsError> {
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
+    unsafe {
+        write_verified(CR0_GUEST_HOST_MASK, controls.cr0_mask)?;
+        write_verified(CR4_GUEST_HOST_MASK, controls.cr4_mask)?;
+        write_verified(CR0_READ_SHADOW, controls.cr0_shadow)?;
+        write_verified(CR4_READ_SHADOW, controls.cr4_shadow)?;
+    }
+    Ok(())
+}
+
 /// Writes the EPT pointer and reads it back. VM entry checks it only when
 /// the "enable EPT" secondary control is set.
 ///

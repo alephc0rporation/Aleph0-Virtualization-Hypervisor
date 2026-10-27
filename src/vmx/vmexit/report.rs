@@ -11,9 +11,9 @@ use super::stats::Tally;
 use super::{RegisterFrame, dump, history, read_field, stats};
 use crate::vmx::ept::{Eptp, InveptType, Retyped};
 use crate::vmx::exit_decision::{
-    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EXCEPTION_OR_NMI, EXIT_REASON_RDMSR, EXIT_REASON_VMCALL, EXIT_REASON_WRMSR,
-    EptQualification, ExitEvent, ExitInfo, ExitState, InterruptionInfo, PLANNED_MAIN_VMCALLS, exit_reason_name,
-    expected_main_rax, wrmsr_value,
+    CrQualification, CrWrite, EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EXCEPTION_OR_NMI, EXIT_REASON_RDMSR,
+    EXIT_REASON_VMCALL, EXIT_REASON_WRMSR, EptQualification, ExitEvent, ExitInfo, ExitState, InterruptionInfo,
+    PLANNED_MAIN_VMCALLS, exit_reason_name, expected_main_rax, wrmsr_value,
 };
 use crate::vmx::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE};
 use crate::vmx::hyperv;
@@ -381,6 +381,16 @@ fn report_event(
         ),
         ExitEvent::Emulated(_) => report_emulation(number, resumed.and_then(|resumed| resumed.emulated), rip),
         ExitEvent::GuestGeneralProtection => report_general_protection(number, exit, rip),
+        ExitEvent::ControlRegisterWrite(write) => report_cr_write(number, write, rip),
+        ExitEvent::ControlRegisterGeneralProtection => crate::serial_println!(
+            "{tag} VM exit #{number}: MOV to CR{} <- {:#x}: a value the guest could not set on a CPU without VMX (CR4.VMXE or a reserved bit); injecting #GP(0) at rip={rip:#018x}.",
+            exit.map_or(0, |exit| CrQualification(exit.qualification).cr()),
+            exit.map_or(0, |exit| exit.cr_source),
+        ),
+        ExitEvent::ControlRegisterUnhandled => crate::serial_println!(
+            "{tag} VM exit #{number}: control-register access (qualification={:#018x}) Aleph0 does not handle (MOV from CR, CLTS, LMSW, CR3/CR8, or leaving protected mode/paging).",
+            exit.map_or(0, |exit| exit.qualification),
+        ),
         // Not "resuming the guest": `run-hyperv.ps1 -InjectNmi` waits for
         // that text after main VMCALL #1, and this exit comes before it.
         ExitEvent::Halted => crate::serial_println!("{tag} VM exit #{number}: HLT; going on at rip={rip:#018x}."),
@@ -497,6 +507,21 @@ fn report_invalid_opcode(number: u64, exit: Option<ExitInfo>, rip: u64) {
             "{tag} VM exit #{number}: MWAIT or MONITOR, which the guest's CPUID does not offer; injecting #UD at rip={rip:#018x}."
         ),
     }
+}
+
+/// Prints a MOV to CR0/CR4 Aleph0 emulated: the value the guest asked for
+/// (also its new read shadow), and the real GUEST_CRn, which keeps the VMX
+/// fixed bits (so CR4.VMXE stays set, CR0.NE stays set).
+fn report_cr_write(number: u64, write: CrWrite, rip: u64) {
+    crate::serial_println!(
+        "{} VM exit #{number}: MOV to {} <- {:#x}: guest reads {:#x} back (read shadow), GUEST_{} = {:#x}; resuming at rip={rip:#018x}.",
+        crate::TAG,
+        write.cr.name(),
+        write.requested,
+        write.requested,
+        write.cr.name(),
+        write.real,
+    );
 }
 
 /// Prints why the guest gets a #GP at its RDMSR or WRMSR: for a WRMSR of

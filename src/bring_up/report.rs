@@ -8,6 +8,7 @@ use uefi::boot::MemoryType;
 use super::PassthroughState;
 use crate::vmx;
 use crate::vmx::apic::{ApicBase, LAPIC_VERSION};
+use crate::vmx::cr::CrControls;
 use crate::vmx::ept::{Ept, EptSupport, Hidden, TypeTables, WalkEnd};
 use crate::vmx::exit_bitmaps::{ExitBitmaps, INTERCEPTED_MSRS, INTERCEPTED_PORTS};
 use crate::vmx::guest::{GuestMappings, GuestMemory};
@@ -57,6 +58,18 @@ pub(super) fn segment_state() {
     if state.tr == 0 {
         log!("WARNING: TR is 0; VM entry would reject this host state.");
     }
+}
+
+/// Prints the CR0/CR4 guest/host masks and initial read shadows: which bits
+/// the guest owns, and the view it gets of them (CR4.VMXE hidden).
+pub(super) fn cr_controls(controls: &CrControls) {
+    log!(
+        "CR shadowing: CR0 mask={:#x} shadow={:#x}; CR4 mask={:#x} shadow={:#x} (VMXE hidden from the guest).",
+        controls.cr0_mask,
+        controls.cr0_shadow,
+        controls.cr4_mask,
+        controls.cr4_shadow,
+    );
 }
 
 /// Prints the VMX capability MSRs: IA32_VMX_BASIC; for each of the four

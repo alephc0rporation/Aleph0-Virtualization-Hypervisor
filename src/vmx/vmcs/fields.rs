@@ -208,6 +208,16 @@ pub const GUEST_ACTIVITY_STATE: u32 = 0x4826;
 /// Guest SYSENTER code selector (32-bit).
 pub const GUEST_IA32_SYSENTER_CS: u32 = 0x482A;
 
+/// CR0 and CR4 guest/host masks (natural width): a bit set means the host
+/// (Aleph0) owns it, so a guest MOV changing it away from the read shadow
+/// exits (reason 28), and MOV from CRn reads the shadow for it.
+pub const CR0_GUEST_HOST_MASK: u32 = 0x6000;
+pub const CR4_GUEST_HOST_MASK: u32 = 0x6002;
+/// CR0 and CR4 read shadows (natural width): the value a guest reads for the
+/// bits its mask owns (the real GUEST_CRn is read for the rest).
+pub const CR0_READ_SHADOW: u32 = 0x6004;
+pub const CR4_READ_SHADOW: u32 = 0x6006;
+
 /// Guest control registers (natural width).
 pub const GUEST_CR0: u32 = 0x6800;
 pub const GUEST_CR3: u32 = 0x6802;

@@ -38,13 +38,16 @@
 //! exits: `vmexit::stats` does, for every guest, from what the handler
 //! carried out.
 
+mod control_register;
 mod emulation;
 mod scenario;
 
+use crate::vmx::cr::CrFixed;
 use crate::vmx::mtrr::MtrrCapabilities;
 use crate::vmx::vmcall;
 use crate::vmx::vmcs::GuestKind;
 
+pub use control_register::{CrNumber, CrQualification, CrWrite};
 pub use emulation::{Emulation, IoSize, cpuid_policy, is_canonical_48, merge_in, wrmsr_value};
 pub use scenario::{PLANNED_MAIN_VMCALLS, expected_main_rax};
 
@@ -111,6 +114,9 @@ pub const EXIT_REASON_CPUID: u16 = 10;
 pub const EXIT_REASON_HLT: u16 = 12;
 /// Basic exit reason of a VMCALL exit.
 pub const EXIT_REASON_VMCALL: u16 = 18;
+/// Basic exit reason of a control-register access: a MOV to a CR0/CR4 bit the
+/// guest/host mask owns, CLTS, or LMSW.
+pub const EXIT_REASON_CONTROL_REGISTER: u16 = 28;
 /// Basic exit reason of IN/OUT (and INS/OUTS) to a port the I/O bitmaps
 /// intercept.
 pub const EXIT_REASON_IO_INSTRUCTION: u16 = 30;
@@ -373,6 +379,13 @@ pub struct ExitInfo {
     /// Registers": SS.DPL is the CPL), read for VMCALL exits only; 0
     /// otherwise, which [`decide`] never looks at.
     pub guest_cpl: u8,
+    /// The value a MOV to CR0/CR4 loads, from the register the exit
+    /// qualification names (`CrQualification::gpr`, GUEST_RSP for RSP). Read
+    /// for control-register exits only; 0 otherwise.
+    pub cr_source: u64,
+    /// The CR0/CR4 FIXED MSRs, for the control-register decision. Read for
+    /// control-register exits only; [`CrFixed::NONE`] otherwise.
+    pub cr_fixed: CrFixed,
 }
 
 /// The CPL from the guest's SS access rights (GUEST_SS_ACCESS_RIGHTS): its
@@ -483,6 +496,15 @@ pub enum ExitEvent {
     /// no MSR at, a non-canonical value for an intercepted MSR, or a value
     /// its MTRRs would refuse.
     GuestGeneralProtection,
+    /// A MOV to CR0/CR4 Aleph0 emulates: write the read shadow and GUEST_CRn,
+    /// then resume past it (`control_register`).
+    ControlRegisterWrite(CrWrite),
+    /// A MOV to CR0/CR4 the guest could not have made on a CPU without VMX
+    /// (CR4.VMXE set, or a bit FIXED1 forbids): inject #GP(0).
+    ControlRegisterGeneralProtection,
+    /// A control-register access Aleph0's masks should never have let exit, or
+    /// a write leaving protected mode or paging: stop with the qualification.
+    ControlRegisterUnhandled,
     /// HLT: resume past it at once. The guest's next instruction runs as if
     /// an interrupt had woken it.
     Halted,
@@ -532,6 +554,9 @@ pub struct ResumePlan {
     /// that faulted delivery left bit 3 set, and VM entry refuses to inject
     /// an NMI while it is ([`ResumePlan::redelivering`]).
     pub clear_nmi_blocking: bool,
+    /// Write a guest CR0/CR4 value and its read shadow before resuming, for a
+    /// MOV to CR0/CR4 Aleph0 emulates ([`ExitEvent::ControlRegisterWrite`]).
+    pub write_cr: Option<CrWrite>,
 }
 
 impl ResumePlan {
@@ -545,6 +570,7 @@ impl ResumePlan {
         inject_exception: None,
         redeliver: None,
         clear_nmi_blocking: false,
+        write_cr: None,
     };
     /// Inject an NMI, delivered before the instruction the guest was about
     /// to run. Injecting always turns NMI-window exiting off: it may have
@@ -559,6 +585,7 @@ impl ResumePlan {
         inject_exception: None,
         redeliver: None,
         clear_nmi_blocking: false,
+        write_cr: None,
     };
     /// Go on where the guest was, with NMI-window exiting on, so the next
     /// exit comes as soon as the guest can take an NMI.
@@ -571,6 +598,7 @@ impl ResumePlan {
         inject_exception: None,
         redeliver: None,
         clear_nmi_blocking: false,
+        write_cr: None,
     };
     /// Make the protected page writable; RIP stays on the faulting write, so
     /// it runs again.
@@ -583,6 +611,7 @@ impl ResumePlan {
         inject_exception: None,
         redeliver: None,
         clear_nmi_blocking: false,
+        write_cr: None,
     };
     /// Inject #GP(0); RIP stays on the faulting instruction, as for any
     /// fault.
@@ -595,6 +624,7 @@ impl ResumePlan {
         inject_exception: Some(InterruptionInfo::GENERAL_PROTECTION),
         redeliver: None,
         clear_nmi_blocking: false,
+        write_cr: None,
     };
     /// Inject #UD; RIP stays on the faulting instruction.
     pub const INJECT_UD: Self = Self {
@@ -703,7 +733,13 @@ impl ExitEvent {
                 emulate: Some(emulation),
                 ..ResumePlan::PAST_INSTRUCTION
             }),
-            Self::GuestGeneralProtection => ExitAction::Resume(ResumePlan::INJECT_GP),
+            Self::GuestGeneralProtection | Self::ControlRegisterGeneralProtection => {
+                ExitAction::Resume(ResumePlan::INJECT_GP)
+            }
+            Self::ControlRegisterWrite(write) => ExitAction::Resume(ResumePlan {
+                write_cr: Some(write),
+                ..ResumePlan::PAST_INSTRUCTION
+            }),
             Self::Halted | Self::BootServicesEnded | Self::TestVmcall => {
                 ExitAction::Resume(ResumePlan::PAST_INSTRUCTION)
             }
@@ -713,6 +749,7 @@ impl ExitEvent {
             | Self::DataPageMismatch
             | Self::EptViolation
             | Self::EptMisconfig
+            | Self::ControlRegisterUnhandled
             | Self::Unexpected => ExitAction::Unexpected,
         }
     }
@@ -743,6 +780,7 @@ pub fn decide(guest: GuestKind, state: ExitState, exit: ExitInfo) -> (ExitEvent,
         EXIT_REASON_EPT_VIOLATION if test_guest => scenario::ept_violation(state, &exit),
         EXIT_REASON_EPT_VIOLATION => (ExitEvent::EptViolation, state),
         EXIT_REASON_EPT_MISCONFIG => (ExitEvent::EptMisconfig, state),
+        EXIT_REASON_CONTROL_REGISTER => (control_register::control_register(&exit), state),
         EXIT_REASON_VMCALL if test_guest => scenario::vmcall(state, &exit),
         EXIT_REASON_VMCALL => (firmware_vmcall(&exit), state),
         _ => (ExitEvent::Unexpected, state),

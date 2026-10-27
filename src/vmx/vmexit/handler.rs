@@ -29,12 +29,13 @@ use super::stats::{self, VcpuStats};
 use super::{RegisterFrame, read_field};
 use crate::output::Phase;
 use crate::port;
+use crate::vmx::cr::CrFixed;
 use crate::vmx::ept::{self, InveptType, ProtectedPage};
 use crate::vmx::exit_decision::{
-    EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION, EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_VMCALL, Emulation,
-    ExitAction, ExitEvent, ExitInfo, ExitReason, ExitState, InterruptionInfo, IoSize, Redelivery, ResumePlan,
-    UNREADABLE_REASON, after_nmi_redelivery, after_skipped_instruction, cpl_from_ss, cpuid_policy, decide,
-    is_canonical_48, merge_in,
+    CrNumber, CrQualification, EXIT_REASON_CONTROL_REGISTER, EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION,
+    EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_VMCALL, Emulation, ExitAction, ExitEvent, ExitInfo, ExitReason, ExitState,
+    InterruptionInfo, IoSize, Redelivery, ResumePlan, UNREADABLE_REASON, after_nmi_redelivery,
+    after_skipped_instruction, cpl_from_ss, cpuid_policy, decide, is_canonical_48, merge_in,
 };
 use crate::vmx::host;
 use crate::vmx::hyperv::{self, HypercallRegisters};
@@ -43,9 +44,10 @@ use crate::vmx::msr;
 use crate::vmx::mtrr::MtrrMsr;
 use crate::vmx::page;
 use crate::vmx::vmcs::fields::{
-    EXIT_QUALIFICATION, GUEST_INTERRUPTIBILITY_STATE, GUEST_PHYSICAL_ADDRESS, GUEST_RIP, GUEST_SS_ACCESS_RIGHTS,
-    IDT_VECTORING_ERROR_CODE, IDT_VECTORING_INFO, VM_ENTRY_EXCEPTION_ERROR_CODE, VM_ENTRY_INSTRUCTION_LEN,
-    VM_ENTRY_INTERRUPTION_INFO, VM_EXIT_INSTRUCTION_LEN, VM_EXIT_INTERRUPTION_INFO, VM_EXIT_REASON,
+    CR0_READ_SHADOW, CR4_READ_SHADOW, EXIT_QUALIFICATION, GUEST_CR0, GUEST_CR4, GUEST_INTERRUPTIBILITY_STATE,
+    GUEST_PHYSICAL_ADDRESS, GUEST_RIP, GUEST_RSP, GUEST_SS_ACCESS_RIGHTS, IDT_VECTORING_ERROR_CODE, IDT_VECTORING_INFO,
+    VM_ENTRY_EXCEPTION_ERROR_CODE, VM_ENTRY_INSTRUCTION_LEN, VM_ENTRY_INTERRUPTION_INFO, VM_EXIT_INSTRUCTION_LEN,
+    VM_EXIT_INTERRUPTION_INFO, VM_EXIT_REASON,
 };
 use crate::vmx::vmcs::{self, GuestKind, VmcsError, encode_finished, encode_resume_failed, encode_unexpected};
 
@@ -115,6 +117,40 @@ fn stub_return(action: ExitAction, number: u64, raw_reason: u32) -> u64 {
 /// guest-state checks on RIP. The caller stops the guest instead, in both cases.
 fn next_rip(rip: u64, length: u64) -> Option<u64> {
     rip.checked_add(length).filter(|&next| is_canonical_48(next))
+}
+
+/// The value a MOV to CR0/CR4 loads, from the general-purpose register
+/// `number` names (`CrQualification::gpr`). RSP (4) is not in `frame`; it is
+/// GUEST_RSP, read only for a control-register exit (`rsp`). Returns `None`
+/// when the source is RSP but GUEST_RSP was unreadable.
+fn cr_source_value(number: u8, frame: &RegisterFrame, rsp: Option<Result<u64, VmcsError>>) -> Option<u64> {
+    Some(match number {
+        0 => frame.rax,
+        1 => frame.rcx,
+        2 => frame.rdx,
+        3 => frame.rbx,
+        4 => rsp?.ok()?,
+        5 => frame.rbp,
+        6 => frame.rsi,
+        7 => frame.rdi,
+        8 => frame.r8,
+        9 => frame.r9,
+        10 => frame.r10,
+        11 => frame.r11,
+        12 => frame.r12,
+        13 => frame.r13,
+        14 => frame.r14,
+        // `number` is 4 bits (`CrQualification::gpr`), so the last is R15.
+        _ => frame.r15,
+    })
+}
+
+/// The GUEST_CRn and CRn_READ_SHADOW field encodings for `cr`.
+fn cr_write_fields(cr: CrNumber) -> (u32, u32) {
+    match cr {
+        CrNumber::Cr0 => (GUEST_CR0, CR0_READ_SHADOW),
+        CrNumber::Cr4 => (GUEST_CR4, CR4_READ_SHADOW),
+    }
 }
 
 /// VM-exit handler: decides what the exit is (`exit_decision::decide`),
@@ -305,6 +341,29 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
     let vmcall_exit = decoded.is_some_and(|reason| !reason.entry_failure && reason.basic == EXIT_REASON_VMCALL);
     let ss_access_rights = vmcall_exit.then(|| read_field(GUEST_SS_ACCESS_RIGHTS));
     let guest_cpl = ss_access_rights.map_or(Some(0), |rights| rights.ok().map(cpl_from_ss));
+    // Only a MOV to CR0/CR4 (reason 28) needs the FIXED MSRs, GUEST_RSP (for a
+    // write sourced from RSP) and the source value; `decide` ignores them for
+    // any other exit.
+    let cr_access_exit =
+        decoded.is_some_and(|reason| !reason.entry_failure && reason.basic == EXIT_REASON_CONTROL_REGISTER);
+    // SAFETY: exit context implies VMX operation, so the FIXED MSRs exist.
+    let cr_fixed = if cr_access_exit {
+        unsafe { CrFixed::read() }
+    } else {
+        CrFixed::NONE
+    };
+    let guest_rsp = cr_access_exit.then(|| read_field(GUEST_RSP));
+    // The value the MOV loads; `None` only if its source is RSP and GUEST_RSP
+    // was unreadable, which leaves the exit unjudged. `Some(0)` for any other
+    // exit, which `decide` never looks at.
+    let cr_source = if cr_access_exit {
+        match qualification {
+            Ok(qualification) => cr_source_value(CrQualification(qualification).gpr(), frame, guest_rsp),
+            Err(_) => None,
+        }
+    } else {
+        Some(0)
+    };
     let rip = read_field(GUEST_RIP);
     let length = read_field(VM_EXIT_INSTRUCTION_LEN);
     let interruptibility = read_field(GUEST_INTERRUPTIBILITY_STATE);
@@ -318,10 +377,13 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
         .and_then(ept::protected_page_for);
     let mtrr = guest_mtrrs::capabilities();
 
-    // Only EPT and I/O exits are judged by EXIT_QUALIFICATION. For any other
-    // exit an unreadable one (reported later) does not matter.
-    let judged_by_qualification =
-        ept_exit || decoded.is_some_and(|reason| !reason.entry_failure && reason.basic == EXIT_REASON_IO_INSTRUCTION);
+    // Only EPT, I/O and control-register exits are judged by
+    // EXIT_QUALIFICATION. For any other exit an unreadable one (reported
+    // later) does not matter.
+    let judged_by_qualification = ept_exit
+        || decoded.is_some_and(|reason| {
+            !reason.entry_failure && matches!(reason.basic, EXIT_REASON_IO_INSTRUCTION | EXIT_REASON_CONTROL_REGISTER)
+        });
     let qualification_for_decide = if judged_by_qualification {
         qualification.ok()
     } else {
@@ -340,6 +402,7 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
         qualification_for_decide,
         guest_physical_for_decide,
         guest_cpl,
+        cr_source,
     ) {
         (
             Some(reason),
@@ -349,6 +412,7 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
             Some(qualification),
             Some(guest_physical),
             Some(guest_cpl),
+            Some(cr_source),
         ) => {
             Some(ExitInfo {
                 reason,
@@ -367,6 +431,8 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
                 mtrr,
                 hyperv: hyperv::offered(),
                 guest_cpl,
+                cr_source,
+                cr_fixed,
             })
         }
         // An unreadable field is reported later; without it the exit cannot
@@ -915,6 +981,13 @@ fn prepare_resume(
             },
             error,
         })?;
+    }
+    if let Some(write) = plan.write_cr {
+        // Emulate a MOV to CR0/CR4: the guest reads `requested` back (the new
+        // read shadow), while GUEST_CRn keeps the VMX fixed bits (`real`).
+        let (guest_field, shadow_field) = cr_write_fields(write.cr);
+        write_for_resume(shadow_field, write.requested, "set the control-register read shadow")?;
+        write_for_resume(guest_field, write.real, "write the guest control register")?;
     }
     let invept = if grant_write {
         let page = read.protected.ok_or(ResumeFailure::NoProtectedPage)?;

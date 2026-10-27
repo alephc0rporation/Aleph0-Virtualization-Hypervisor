@@ -7,6 +7,7 @@
 
 use super::scenario::{BLOCKING_BY_MOV_SS, BLOCKING_BY_NMI, BLOCKING_BY_STI};
 use super::*;
+use crate::vmx::cr::{CR0_NE, CR0_PE, CR0_PG, CR4_VMXE, CrFixed};
 use crate::vmx::guest::{
     GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_IO_VALUE, GUEST_MARKER, GUEST_MSR_VALUE, GUEST_MTRR_BASE, GUEST_NMI_MARKER,
     GUEST_SCRATCH_PORT, expected_stats,
@@ -74,6 +75,30 @@ fn exit(basic: u16) -> ExitInfo {
         mtrr: MtrrCapabilities::NONE,
         hyperv: false,
         guest_cpl: 0,
+        cr_source: 0,
+        cr_fixed: CrFixed::NONE,
+    }
+}
+
+/// FIXED MSRs of the usual shape: CR0 fixes PE, NE and PG (and the high bits
+/// reserved as 0); CR4 fixes VMXE on, allows the common CR4 bits, forbids the
+/// rest. The reason-28 decision follows from these (`vmx::cr`).
+const CR_FIXED: CrFixed = CrFixed {
+    cr0_fixed0: 0x8000_0021,
+    cr0_fixed1: 0xFFFF_FFFF,
+    cr4_fixed0: CR4_VMXE,
+    cr4_fixed1: 0x2_7FFF,
+};
+
+/// A MOV to CR `cr` loading `source` from register `gpr`: exit qualification
+/// with access type 0 (MOV to CR), the CR number in bits 3:0 and the register
+/// in bits 11:8.
+fn cr_mov(cr: u8, gpr: u8, source: u64) -> ExitInfo {
+    ExitInfo {
+        qualification: u64::from(cr) | (u64::from(gpr) << 8),
+        cr_source: source,
+        cr_fixed: CR_FIXED,
+        ..exit(EXIT_REASON_CONTROL_REGISTER)
     }
 }
 
@@ -827,6 +852,7 @@ fn each_event_maps_to_its_action() {
             inject_exception: None,
             redeliver: None,
             clear_nmi_blocking: false,
+            write_cr: None,
         })
     };
     assert_eq!(ExitEvent::MainVmcall.action(), resume(true, false, None, false));
@@ -1431,14 +1457,9 @@ fn the_firmware_stops_at_an_unhandled_exit() {
         },
         ..exit(33)
     };
-    // A triple fault (2), a CR access (28), an EPT misconfiguration (49).
-    for exit in [
-        page_fault,
-        entry_failure,
-        exit(2),
-        exit(28),
-        exit(EXIT_REASON_EPT_MISCONFIG),
-    ] {
+    // A triple fault (2) and an EPT misconfiguration (49). (A control-register
+    // access, reason 28, is now handled; its stop cases are tested below.)
+    for exit in [page_fault, entry_failure, exit(2), exit(EXIT_REASON_EPT_MISCONFIG)] {
         assert_eq!(
             firmware(START, exit),
             ExitAction::Unexpected,
@@ -1446,6 +1467,115 @@ fn the_firmware_stops_at_an_unhandled_exit() {
             exit.reason.basic
         );
     }
+}
+
+#[test]
+fn fixed_values_name_the_bits_the_masks_own() {
+    assert_eq!(
+        CR_FIXED.cr0_owned() & (CR0_PE | CR0_NE | CR0_PG),
+        CR0_PE | CR0_NE | CR0_PG
+    );
+    assert!(CR_FIXED.cr4_owned() & CR4_VMXE != 0);
+}
+
+#[test]
+fn clearing_cr0_ne_is_emulated_and_keeps_the_real_bit() {
+    // The guest writes CR0 with PE and PG kept but NE cleared.
+    let requested = CR0_PE | CR0_PG;
+    let (event, _) = decide(GuestKind::Firmware, START, cr_mov(0, 1, requested));
+    let ExitEvent::ControlRegisterWrite(write) = event else {
+        panic!("a MOV to CR0 clearing NE is emulated, got {event:?}");
+    };
+    assert_eq!(write.cr, CrNumber::Cr0);
+    assert_eq!(write.requested, requested); // the guest reads NE = 0 back
+    assert!(write.real & CR0_NE != 0); // GUEST_CR0 keeps NE = 1
+    assert!(write.requested & CR0_NE == 0);
+}
+
+#[test]
+fn setting_cr4_vmxe_gets_general_protection() {
+    // The guest's CPUID hides VMX, so it could not set VMXE on a real CPU.
+    let (event, _) = decide(GuestKind::Firmware, START, cr_mov(4, 2, CR4_VMXE));
+    assert_eq!(event, ExitEvent::ControlRegisterGeneralProtection);
+}
+
+#[test]
+fn a_cr4_bit_fixed1_forbids_gets_general_protection() {
+    // Bit 31 is outside CR_FIXED.cr4_fixed1, so it must be 0 in VMX operation.
+    let (event, _) = decide(GuestKind::Firmware, START, cr_mov(4, 0, 1 << 31));
+    assert_eq!(event, ExitEvent::ControlRegisterGeneralProtection);
+}
+
+#[test]
+fn a_cr4_write_without_vmxe_is_emulated_with_real_vmxe_set() {
+    // A CR4 write with VMXE clear (as Linux does): emulated, and the real
+    // GUEST_CR4 keeps VMXE set (it is a FIXED0 bit).
+    let (event, _) = decide(GuestKind::Firmware, START, cr_mov(4, 3, 0));
+    let ExitEvent::ControlRegisterWrite(write) = event else {
+        panic!("a legal CR4 write is emulated, got {event:?}");
+    };
+    assert_eq!(write.requested, 0); // the guest reads VMXE = 0
+    assert!(write.real & CR4_VMXE != 0); // GUEST_CR4 keeps VMXE = 1
+}
+
+#[test]
+fn clearing_cr0_pe_or_pg_stops() {
+    // Leaving protected mode or paging needs an unrestricted guest.
+    for requested in [CR0_PG, CR0_PE, 0] {
+        let (event, _) = decide(GuestKind::Firmware, START, cr_mov(0, 0, requested));
+        assert_eq!(event, ExitEvent::ControlRegisterUnhandled, "requested={requested:#x}");
+    }
+}
+
+#[test]
+fn a_mov_from_cr_clts_or_lmsw_stops() {
+    // Aleph0's masks own no bit these can change, so they should not exit; if
+    // one does, stop. Access type is bits 5:4 of the qualification.
+    for access in [1u64, 2, 3] {
+        let exit = ExitInfo {
+            qualification: access << 4,
+            cr_fixed: CR_FIXED,
+            ..exit(EXIT_REASON_CONTROL_REGISTER)
+        };
+        assert_eq!(
+            decide(GuestKind::Firmware, START, exit).0,
+            ExitEvent::ControlRegisterUnhandled,
+            "access={access}"
+        );
+    }
+}
+
+#[test]
+fn the_cr_events_map_to_their_actions() {
+    let write = CrWrite {
+        cr: CrNumber::Cr0,
+        requested: CR0_PE | CR0_PG,
+        real: CR0_PE | CR0_NE | CR0_PG,
+    };
+    assert_eq!(
+        ExitEvent::ControlRegisterWrite(write).action(),
+        ExitAction::Resume(ResumePlan {
+            write_cr: Some(write),
+            ..ResumePlan::PAST_INSTRUCTION
+        })
+    );
+    assert_eq!(
+        ExitEvent::ControlRegisterGeneralProtection.action(),
+        ExitAction::Resume(ResumePlan::INJECT_GP)
+    );
+    assert_eq!(ExitEvent::ControlRegisterUnhandled.action(), ExitAction::Unexpected);
+}
+
+#[test]
+fn a_write_matching_the_shadow_in_the_owned_bits_does_not_exit() {
+    // The SDM's condition, as `vmx::cr::mov_exits`: Linux clearing CR4.VMXE
+    // while the shadow shows VMXE = 0 changes no owned bit, so no reason-28
+    // exit.
+    use crate::vmx::cr::mov_exits;
+    let owned = CR_FIXED.cr4_owned();
+    let shadow = 0; // VMXE clear
+    assert!(!mov_exits(0, shadow, owned));
+    assert!(mov_exits(CR4_VMXE, shadow, owned));
 }
 
 #[test]

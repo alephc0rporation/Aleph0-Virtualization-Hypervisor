@@ -40,6 +40,8 @@ fn exit(basic: u16) -> ExitInfo {
         mtrr: MtrrCapabilities::NONE,
         hyperv: false,
         guest_cpl: 0,
+        cr_source: 0,
+        cr_fixed: crate::vmx::cr::CrFixed::NONE,
     }
 }
 
