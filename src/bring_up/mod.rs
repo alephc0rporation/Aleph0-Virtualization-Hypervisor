@@ -311,17 +311,18 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
     let mtrrs = MtrrState::new(vmx::mtrr::read()?)?;
     let capabilities = mtrrs.registers().capabilities();
     report::mtrrs(mtrrs.mtrrs());
+    let protected_pages = [guest.data_page(), guest.stack_page()];
     // SAFETY: boot services are still active, and UEFI identity-maps
-    // memory, which also makes the data page's address its GPA.
+    // memory, which also makes the guest pages' addresses their GPAs.
     let (ept, types) = unsafe {
         Ept::build(
-            guest.data_page(),
+            &protected_pages,
             ept_support,
             mtrrs.mtrrs(),
             ept::spare_pts(capabilities),
         )
     }?;
-    report::ept(&ept, &types, guest.data_page());
+    report::ept(&ept, &types, &protected_pages);
     let _local_apic = check_local_apic(&ept, &types, ept_support)?;
     // Test only: the guest's read of the Local APIC then meets a PDPT entry
     // the CPU refuses, so the run shows the EPT misconfiguration stop and

@@ -1,5 +1,6 @@
 //! The test guest's own exits: its write to the EPT-protected data page,
-//! its main VMCALLs, and NMI reinjection. `decide` sends only the test
+//! its main VMCALLs, NMI reinjection, and the reinjected NMI's delivery
+//! faulting on the EPT-protected stack page. `decide` sends only the test
 //! guest's VMCALLs and EPT violations here; NMI reinjection serves every
 //! guest, the firmware too.
 //!
@@ -17,6 +18,9 @@
 //!                    guest cannot yet (STI, MOV SS or NMI blocking):
 //!                                             turn on NMI-window exiting,
 //! NMI-window exit──▶                          inject when the window opens
+//! EPT violation  ──▶ the injected NMI's delivery pushed the interrupt frame
+//!  (IDT-vectoring   onto the read-only stack page: make it writable and
+//!   = the NMI)      re-deliver the NMI (the handler, from IDT-vectoring)
 //! VMCALL with GUEST_NMI_MARKER (the guest's NMI handler) ──▶ resume past it
 //! main VMCALL #2 ──▶ finished
 //! ```
@@ -109,24 +113,48 @@ pub(super) fn nmi_window(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitS
     }
 }
 
-/// EPT violation (exit reason 48). Exactly one is handled: the guest's
-/// write to its protected data page, which must come before the first main
-/// VMCALL. Any other is [`ExitEvent::EptViolation`].
+/// EPT violation (exit reason 48). Two are handled, each once: the guest's
+/// write to its protected data page (before the first main VMCALL), and the
+/// reinjected NMI's delivery faulting on the read-only stack page as the CPU
+/// pushes the interrupt frame. The reinjected NMI's delivery carries the NMI
+/// in the exit's IDT-vectoring field, which the handler re-delivers on top of
+/// the grant (`ExitInfo::redelivery`).
+///
+/// The two faults are told apart by which read-only page the GPA fell in, not
+/// by the IDT-vectoring field: the guest's main code never touches the stack
+/// (only the NMI handler's push after the grant does), and a hypervisor
+/// underneath may report the interrupted NMI's delivery with interruption
+/// type 3 rather than 2 (Hyper-V does), so the vectoring field is not a
+/// reliable discriminator. Any other EPT violation, a stray repeat of either
+/// included, is [`ExitEvent::EptViolation`].
 pub(super) fn ept_violation(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
+    let frame = exit.guest_physical & !0xFFF;
     let protected_write = exit.protected_page != 0
-        && exit.guest_physical & !0xFFF == exit.protected_page
+        && frame == exit.protected_page
         && EptQualification(exit.qualification).is_protected_write();
-    if protected_write && state.ept_writes_granted == 0 {
-        (
-            ExitEvent::EptWriteGranted,
-            ExitState {
-                ept_writes_granted: 1,
-                ..state
-            },
-        )
-    } else {
-        (ExitEvent::EptViolation, state)
+    if protected_write {
+        if exit.stack_page != 0 && frame == exit.stack_page {
+            // The push for the reinjected NMI faulted on the read-only stack page.
+            if state.nmi_stack_grants == 0 {
+                return (
+                    ExitEvent::EptWriteGranted,
+                    ExitState {
+                        nmi_stack_grants: 1,
+                        ..state
+                    },
+                );
+            }
+        } else if state.ept_writes_granted == 0 {
+            return (
+                ExitEvent::EptWriteGranted,
+                ExitState {
+                    ept_writes_granted: 1,
+                    ..state
+                },
+            );
+        }
     }
+    (ExitEvent::EptViolation, state)
 }
 
 /// VMCALL (exit reason 18): the guest's NMI handler, or its next main

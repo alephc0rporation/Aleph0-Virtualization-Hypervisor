@@ -120,10 +120,10 @@ pub(super) fn ept_support(support: EptSupport) {
 /// Prints the EPT identity map [`Ept::build`] made, and how its entries
 /// (`types`) map each run of it: read back from the entries, so the lines
 /// show what the CPU walks.
-pub(super) fn ept(ept: &Ept, types: &TypeTables, data_page: u64) {
+pub(super) fn ept(ept: &Ept, types: &TypeTables, protected_pages: &[u64]) {
     let layout = ept.layout();
     log!(
-        "EPT built: identity 0x0..{:#x} ({} GiB), {} table pages: {} PDPT(s); {} PD(s), for 0x0..{:#x}, with {} PTs for 2 MiB regions mapped in 4 KiB pages and {} spare PTs for the guest's MTRR writes; {} GiB above as 1 GiB pages; data page {data_page:#018x} read-only (R=1 W=0 X=0).",
+        "EPT built: identity 0x0..{:#x} ({} GiB), {} table pages: {} PDPT(s); {} PD(s), for 0x0..{:#x}, with {} PTs for 2 MiB regions mapped in 4 KiB pages and {} spare PTs for the guest's MTRR writes; {} GiB above as 1 GiB pages; {} pages read-only (R=1 W=0 X=0).",
         ept.end(),
         ept.end() >> 30,
         ept.table_pages(),
@@ -133,7 +133,11 @@ pub(super) fn ept(ept: &Ept, types: &TypeTables, data_page: u64) {
         ept.split_regions(),
         ept.spare_pts(),
         layout.huge_gibs(),
+        protected_pages.len(),
     );
+    for page in protected_pages {
+        log!("EPT read-only page: {page:#018x}.");
+    }
     let ram = types.ram().ranges();
     log!(
         "EPT memory types: the MTRRs' for the {} RAM range(s) of the UEFI memory map, UC for everything else (MMIO, reserved memory, holes).",

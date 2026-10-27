@@ -26,6 +26,7 @@ const START: ExitState = ExitState {
     nmi_pending: false,
     nmis_handled: 0,
     ept_writes_granted: 0,
+    nmi_stack_grants: 0,
 };
 /// After the EPT violation: the data page is writable, main VMCALL #1 next.
 const WRITTEN: ExitState = ExitState {
@@ -40,6 +41,10 @@ const WAITING: ExitState = ExitState {
 
 /// GPA of the guest's read-only data page.
 const PROTECTED_PAGE: u64 = 0x7eb1_d000;
+/// GPA of the guest's read-only stack page, where the reinjected NMI's
+/// delivery faults. The Hyper-V `-InjectNmi` run faulted at 0x7ff7fff8, in
+/// this frame.
+const STACK_PAGE: u64 = 0x7ff7_f000;
 /// Exit qualification of the guest's write to it: a write (bit 1) to a page
 /// that is readable (bit 3) but not writable or executable, through the
 /// guest's linear address (bits 7 and 8). Hyper-V and bare metal may set
@@ -65,6 +70,7 @@ fn exit(basic: u16) -> ExitInfo {
         qualification: 0,
         guest_physical: 0,
         protected_page: PROTECTED_PAGE,
+        stack_page: STACK_PAGE,
         mtrr: MtrrCapabilities::NONE,
         hyperv: false,
         guest_cpl: 0,
@@ -83,6 +89,20 @@ fn ept_violation(gpa: u64, qualification: u64) -> ExitInfo {
 /// The guest's write to its data page, 4 bytes in (any offset counts).
 fn protected_write() -> ExitInfo {
     ept_violation(PROTECTED_PAGE + 4, PROTECTED_WRITE)
+}
+
+/// The reinjected NMI's delivery faulting on the read-only stack page as the
+/// CPU pushes the interrupt frame: an EPT write violation on the stack page,
+/// its IDT-vectoring field holding the interrupted NMI (`vectoring`). The
+/// offset mirrors the Hyper-V run's GPA 0x7ff7fff8.
+fn nmi_stack_fault(vectoring: InterruptionInfo) -> ExitInfo {
+    ExitInfo {
+        guest_physical: STACK_PAGE + 0xFF8,
+        protected_page: STACK_PAGE,
+        idt_vectoring: vectoring,
+        qualification: PROTECTED_WRITE,
+        ..exit(EXIT_REASON_EPT_VIOLATION)
+    }
 }
 
 fn vmcall(rax: u64) -> ExitInfo {
@@ -192,6 +212,7 @@ fn violation_with_nothing_protected_stops_with_the_violation() {
     // Before Ept::build the protected page is 0, and GPA 0 must not match.
     let unprotected = ExitInfo {
         protected_page: 0,
+        stack_page: 0,
         ..ept_violation(0, PROTECTED_WRITE)
     };
     assert_eq!(
@@ -501,6 +522,8 @@ fn full_nmi_run_finishes_with_both_counts() {
         protected_write(),
         vmcall(MARKER),
         nmi(0),
+        // The injected NMI's delivery faults on the read-only stack page.
+        nmi_stack_fault(VECTORING_NMI),
         vmcall(NMI_MARKER),
         vmcall(MARKER + 1),
     ] {
@@ -514,6 +537,7 @@ fn full_nmi_run_finishes_with_both_counts() {
             nmi_pending: false,
             nmis_handled: 1,
             ept_writes_granted: 1,
+            nmi_stack_grants: 1,
         },
     );
 }
@@ -525,6 +549,8 @@ fn deferred_nmi_run_finishes_with_both_counts() {
         vmcall(MARKER),
         nmi(BLOCKING_BY_NMI),
         exit(EXIT_REASON_NMI_WINDOW),
+        // The window-injected NMI's delivery faults on the read-only stack page.
+        nmi_stack_fault(VECTORING_NMI),
         vmcall(NMI_MARKER),
         vmcall(MARKER + 1),
     ];
@@ -541,6 +567,7 @@ fn deferred_nmi_run_finishes_with_both_counts() {
             nmi_pending: false,
             nmis_handled: 1,
             ept_writes_granted: 1,
+            nmi_stack_grants: 1,
         },
     );
 }
@@ -565,15 +592,14 @@ fn a_vectoring_exit_is_still_judged_by_its_reason() {
 
 #[test]
 fn an_ept_violation_during_delivery_grants_write_and_re_delivers() {
-    // The test guest's reinjected NMI faults on its read-only data page: an
-    // EPT violation whose IDT-vectoring field holds the NMI. Grant write,
-    // and re-deliver the NMI on the retried entry.
-    let interrupted = ExitInfo {
-        idt_vectoring: VECTORING_NMI,
-        ..protected_write()
-    };
-    let (event, _) = decide(GuestKind::BuiltInTest, START, interrupted);
+    // The test guest's reinjected NMI faults on its read-only stack page as
+    // the CPU pushes the interrupt frame: an EPT violation whose IDT-vectoring
+    // field holds the NMI. Grant write, and re-deliver the NMI on the retried
+    // entry.
+    let interrupted = nmi_stack_fault(VECTORING_NMI);
+    let (event, state) = decide(GuestKind::BuiltInTest, START, interrupted);
     assert_eq!(event, ExitEvent::EptWriteGranted);
+    assert_eq!(state.nmi_stack_grants, 1);
     let plan = match event.action() {
         ExitAction::Resume(plan) => plan,
         other => panic!("expected a resume, got {other:?}"),
@@ -584,14 +610,119 @@ fn an_ept_violation_during_delivery_grants_write_and_re_delivers() {
         plan.redelivering(redelivery),
         Some(ResumePlan {
             redeliver: Some(redelivery),
+            // The faulted NMI delivery left blocking by NMI set; re-delivery
+            // clears it so VM entry can inject the NMI.
+            clear_nmi_blocking: true,
             ..ResumePlan::RETRY_AFTER_GRANT
         })
     );
 }
 
 #[test]
+fn the_nmi_delivery_fault_is_a_separate_grant_from_the_data_write() {
+    // The data-page write was already granted; the reinjected NMI's delivery
+    // now faults on the stack page. It advances its own counter, so it is
+    // still granted (and re-delivered on top).
+    let after_data = ExitState {
+        ept_writes_granted: 1,
+        ..START
+    };
+    let fault = nmi_stack_fault(VECTORING_NMI);
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, after_data, fault),
+        (
+            ExitEvent::EptWriteGranted,
+            ExitState {
+                nmi_stack_grants: 1,
+                ..after_data
+            }
+        )
+    );
+}
+
+#[test]
+fn a_second_nmi_delivery_fault_is_a_plain_ept_violation() {
+    // One NMI-delivery fault is expected; a repeat means the grant did not
+    // take effect, so it is reported like any other EPT violation.
+    let after_fault = ExitState {
+        nmi_stack_grants: 1,
+        ..START
+    };
+    let fault = nmi_stack_fault(VECTORING_NMI);
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, after_fault, fault),
+        (ExitEvent::EptViolation, after_fault)
+    );
+}
+
+#[test]
 fn no_vectoring_means_no_redelivery() {
     assert_eq!(vmcall(MARKER).redelivery(None), None);
+}
+
+#[test]
+fn nmi_vectoring_accepts_type_2_and_type_3_vector_2() {
+    // Vector 2 is the NMI vector; Hyper-V reports the interrupted NMI with
+    // type 3 rather than type 2, and both count as the NMI.
+    assert!(InterruptionInfo(0x8000_0202).is_nmi_vectoring());
+    assert!(InterruptionInfo(0x8000_0302).is_nmi_vectoring());
+    // Not valid, right type but wrong vector, or a real type-3 exception.
+    assert!(!InterruptionInfo(0x0000_0202).is_nmi_vectoring());
+    assert!(!InterruptionInfo(0x8000_0203).is_nmi_vectoring());
+    assert!(!InterruptionInfo(PAGE_FAULT_INFO).is_nmi_vectoring());
+}
+
+#[test]
+fn a_type_3_vector_2_vectoring_re_delivers_as_an_nmi() {
+    // Hyper-V reports the interrupted NMI as a hardware exception (type 3);
+    // re-delivery must re-arm it as an NMI (type 2), not a #2 exception.
+    let hyperv_nmi = ExitInfo {
+        idt_vectoring: InterruptionInfo(0x8000_0302),
+        ..vmcall(MARKER)
+    };
+    let redelivery = hyperv_nmi.redelivery(None).expect("vector 2 is the NMI");
+    assert_eq!(redelivery.info, InterruptionInfo::NMI);
+    assert!(redelivery.info.is_nmi());
+}
+
+#[test]
+fn re_delivering_a_non_nmi_does_not_clear_nmi_blocking() {
+    // Only a re-delivered NMI needs blocking by NMI cleared; a page fault
+    // leaves it alone.
+    let page_fault = ExitInfo {
+        idt_vectoring: InterruptionInfo(PAGE_FAULT_INFO),
+        ..vmcall(MARKER)
+    };
+    let redelivery = page_fault.redelivery(None).unwrap();
+    let plan = ResumePlan::RETRY_AFTER_GRANT.redelivering(redelivery).unwrap();
+    assert!(!plan.clear_nmi_blocking);
+}
+
+#[test]
+fn a_hyperv_nmi_stack_fault_is_granted_re_delivered_and_unblocks_nmi() {
+    // The Hyper-V `-InjectNmi` run: the reinjected NMI's delivery faults on
+    // the stack page, and Hyper-V reports the interrupted NMI with type 3
+    // (idt_vectoring = 0x8000_0302), with blocking by NMI set. Told apart by
+    // page, it is still the NMI stack grant; re-delivery re-arms a type-2 NMI
+    // and clears NMI blocking so VM entry can inject it.
+    let fault = ExitInfo {
+        interruptibility: BLOCKING_BY_NMI,
+        ..nmi_stack_fault(InterruptionInfo(0x8000_0302))
+    };
+    let (event, state) = decide(GuestKind::BuiltInTest, WRITTEN, fault);
+    assert_eq!(event, ExitEvent::EptWriteGranted);
+    assert_eq!(state.nmi_stack_grants, 1);
+
+    let plan = match event.action() {
+        ExitAction::Resume(plan) => plan,
+        other => panic!("expected a resume, got {other:?}"),
+    };
+    let redelivery = fault.redelivery(None).expect("the NMI is re-delivered");
+    assert_eq!(redelivery.info, InterruptionInfo::NMI);
+    let plan = plan.redelivering(redelivery).expect("re-delivered on top of the grant");
+    assert!(plan.clear_nmi_blocking, "NMI blocking must be cleared for re-delivery");
+    // The handler's helper drops bit 3 of the interruptibility state.
+    assert_eq!(after_nmi_redelivery(BLOCKING_BY_NMI), 0);
 }
 
 #[test]
@@ -695,6 +826,7 @@ fn each_event_maps_to_its_action() {
             emulate: None,
             inject_exception: None,
             redeliver: None,
+            clear_nmi_blocking: false,
         })
     };
     assert_eq!(ExitEvent::MainVmcall.action(), resume(true, false, None, false));
