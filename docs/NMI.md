@@ -5,13 +5,14 @@ guest runs:
 - what an NMI is;
 - why the firmware's IDT cannot take one for the guest;
 - the guest's own IDT and NMI handler;
-- the VMX controls involved (NMI exiting, virtual NMIs, the NMI window);
+- the VMX controls involved (NMI exiting, virtual NMIs, the NMI and
+  interrupt windows);
 - the decision Aleph0 makes on each exit, and how it reinjects the NMI;
 - what the Hyper-V run printed.
 
 Code:
 - `src/vmx/guest.rs`: guest code, guest IDT;
-- `src/vmx/exit_decision/`: the pure decision `decide` (`mod.rs`), and the NMI, NMI-window and VMCALL handlers it dispatches to (`scenario.rs`);
+- `src/vmx/exit_decision/`: the pure decision `decide` (`mod.rs`), and the NMI, NMI-window, interrupt-window and VMCALL handlers it dispatches to (`scenario.rs`);
 - `src/vmx/vmexit/`: the handler that applies it;
 - `src/vmx/vmcs/mod.rs` and `fields.rs`: the controls;
 - `scripts/run-hyperv.ps1 -InjectNmi`: the test.
@@ -32,8 +33,10 @@ An NMI ignores IF. The only thing that holds one back is *NMI blocking*:
 from the moment the CPU delivers an NMI until the handler's `IRET`, a
 second NMI waits. At most one waits; more collapse into it.
 
-Aleph0's guest runs with IF = 0 (guest RFLAGS `0x2`), so no ordinary
-interrupt reaches it, but an NMI still can.
+Aleph0's test guest runs with IF = 0 (guest RFLAGS `0x2`), so no ordinary
+interrupt reaches it, but an NMI still can. The firmware guest keeps the
+firmware's RFLAGS, normally IF = 1, and its ordinary interrupts go straight
+to its own IDT (section 8).
 
 ## 2. Why the guest needs its own IDT
 
@@ -117,15 +120,23 @@ the handler is at +56 and `dec ecx` at +45.
 | NMI exiting | pin-based bit 3 (`0x08`) | an NMI during the guest causes a VM exit (reason 0, interruption type 2) instead of guest delivery |
 | virtual NMIs | pin-based bit 5 (`0x20`) | the CPU tracks the guest's NMI blocking: an injected NMI blocks further ones until the guest's `IRET` |
 | NMI-window exiting | primary bit 22 (`0x400000`) | a VM exit (reason 8) as soon as the guest can take an NMI |
+| interrupt-window exiting | primary bit 2 (`0x4`) | a VM exit (reason 7) as soon as the guest can take an external interrupt: RFLAGS.IF = 1, no STI or MOV SS blocking |
 
-Each depends on the previous one: NMI-window exiting needs virtual NMIs,
-which need NMI exiting. Hyper-V reported `pin allowed=0x3f` and
-`primary allowed=0xf7f9fffe`, so all three are available:
+Each of the first three depends on the previous one: NMI-window exiting
+needs virtual NMIs, which need NMI exiting. Interrupt-window exiting needs
+nothing else. Hyper-V reported `pin allowed=0x3f` and
+`primary allowed=0xf7f9fffe` (bits 2 and 22 set), so all four are
+available:
 - the first two are set at bring-up;
-- bring-up checks that the CPU allows NMI-window exiting, and otherwise
-  stops with `NmiWindowExitingUnsupported`;
-- the exit handler switches NMI-window exiting on and off at run time
-  (`set_nmi_window_exiting`: read, change bit 22, write back).
+- bring-up checks that the CPU allows NMI-window and interrupt-window
+  exiting, and otherwise stops with `NmiWindowExitingUnsupported` or
+  `InterruptWindowExitingUnsupported`;
+- the exit handler switches both windows on and off at run time
+  (`set_nmi_window_exiting`, `set_interrupt_window_exiting`: read, change
+  the bit, write back).
+
+Aleph0 uses interrupt-window exiting only for an NMI an STI shadow holds
+back (section 5), never to inject an external interrupt.
 
 ## 5. Reinjecting: `VM_ENTRY_INTERRUPTION_INFO`
 
@@ -167,15 +178,68 @@ and Aleph0 injects then and turns the window off again.
 
 STI blocking is included even though the original plan left it out.
 Some processors would fail the VM entry, and KVM treats it the same way.
-Injection always turns the window off, which is harmless when it was not
-on.
+Injection always turns both windows off, which is harmless when they were
+not on.
+
+### An STI shadow
+
+STI blocks interrupts until the end of the instruction after it, and VM
+entry may refuse an NMI in that shadow. The NMI window does not always wait
+it out: the SDM lets a processor report an NMI-window exit while blocking by
+STI still holds (Vol. 3C, "NMI-Window Exiting"). Aleph0 cannot inject there
+either, and if it kept the NMI window on, such a CPU would exit again at the
+same instruction, before the guest ever ran it, forever. An OS idles with
+`sti; hlt`, so an NMI there is ordinary.
+
+So when STI is the only blocker, Aleph0 waits for the interrupt window
+instead, with the NMI window off (`ResumePlan::WAIT_FOR_STI_SHADOW`, as
+KVM's `vmx_enable_nmi_window` does):
+- blocking by STI implies RFLAGS.IF = 1 (STI sets it), so the interrupt
+  window opens once the shadow ends, right after the guest's next
+  instruction;
+- at that exit (reason 7) nothing blocks the NMI any more, so Aleph0
+  injects it and turns both windows off;
+- if blocking by NMI or MOV SS holds as well, the NMI window waits as
+  before: by the time that blocking ends, so has the shadow.
+
+One case waits longer: `sti; cli`. The CLI runs inside the shadow and leaves
+IF = 0, so the interrupt window never opens. The NMI stays pending until the
+guest's next exit of any kind, which turns the NMI window back on
+(`ResumePlan::keeping_pending_nmi`), and the NMI window then opens at once.
+Monitor trap flag (primary bit 27), which would step exactly one
+instruction, is not allowed under Hyper-V (bit 27 is clear in
+`0xf7f9fffe`).
+
+### After a fault in an IRET that ended NMI blocking
+
+With virtual NMIs, an NMI handler's IRET ends blocking by NMI as it starts.
+If that IRET then faults (an EPT violation on the stack it pops, or an
+exception the exception bitmap catches), the exit reports bit 12: of the
+EPT violation's exit qualification, or of `VM_EXIT_INTERRUPTION_INFO`
+(Intel SDM Vol. 3C, "Exit Qualification for EPT Violations" and
+"Information for VM Exits Due to Vectored Events"). The guest stopped at
+the IRET, but NMIs are already unblocked: resumed as found, an NMI could
+arrive before the handler has returned.
+
+So any exit Aleph0 resumes from with bit 12 set gets blocking by NMI set
+again (`GUEST_INTERRUPTIBILITY_STATE` bit 3,
+`ResumePlan::restoring_nmi_blocking`, as KVM does): the IRET runs again, or
+gets its fault, with NMIs blocked, as they were before it ran.
+`ExitInfo::faulted_nmi_unblocking_iret` reads the bit only where the SDM
+defines it: never for an exit during an event's delivery (IDT-vectoring
+valid) or for a double fault. That also keeps it apart from the NMI
+re-delivery of section 8, which clears bit 3 and needs a valid
+IDT-vectoring field. The serial report prints `blocking by NMI set again`
+when it happens.
 
 ## 6. The decision on each exit
 
 `exit_decision::decide(state, exit)` is a pure function, and every row
-below is a host unit test. `decide` itself makes the two `any` decisions;
-it sends every other exit to the handler for its reason, and the NMI,
-NMI-window and VMCALL rows are the handlers in `exit_decision/scenario.rs`.
+below is a host unit test. `decide` itself makes the first `any` decision,
+and the handler adds the other two to the plan (`ExitInfo::redelivery`,
+`ResumePlan::restoring_nmi_blocking`); `decide` sends every other exit to
+the handler for its reason, and the NMI, NMI-window, interrupt-window and
+VMCALL rows are the handlers in `exit_decision/scenario.rs`.
 The emulated instructions (CPUID, RDMSR, WRMSR, IN/OUT) have handlers of
 their own in `emulation.rs` and are not in this table
 ([EMULATED_EXITS.md](EMULATED_EXITS.md)):
@@ -184,10 +248,16 @@ their own in `emulation.rs` and are not in this table
 |---|---|---|---|
 | any | VM-entry failure | `Unexpected` | stop |
 | any | IDT-vectoring info valid (the exit interrupted an event's delivery) | the reason's own event | re-deliver the event on top of the plan (section 8) |
-| reason 0, NMI | no STI/MOV SS/NMI blocking | `NmiInjected` | inject, RIP unchanged, window off |
-| reason 0, NMI | some blocking | `NmiDeferred` | NMI pending, window on |
-| reason 8 | NMI pending, still blocked (STI) | `NmiDeferred` | keep waiting |
-| reason 8 | NMI pending, not blocked | `NmiWindowInjected` | inject, window off |
+| any resumed | bit 12 of the EPT qualification or the interruption info (a fault in an NMI-unblocking IRET) | the reason's own event | set blocking by NMI again (section 5) |
+| reason 0, NMI | no STI/MOV SS/NMI blocking | `NmiInjected` | inject, RIP unchanged, both windows off |
+| reason 0, NMI | STI blocking only | `NmiDeferredPastSti` | NMI pending, interrupt window on, NMI window off |
+| reason 0, NMI | MOV SS or NMI blocking | `NmiDeferred` | NMI pending, NMI window on, interrupt window off |
+| reason 8 | NMI pending, STI blocking only | `NmiDeferredPastSti` | interrupt window on, NMI window off |
+| reason 8 | NMI pending, NMI blocking | `NmiDeferred` | keep waiting |
+| reason 8 | NMI pending, not blocked | `NmiWindowInjected` | inject, both windows off |
+| reason 7 | NMI pending, not blocked | `InterruptWindowInjected` | inject, both windows off |
+| reason 7 | NMI pending, NMI blocking | `NmiDeferred` | NMI window on, interrupt window off |
+| reason 7 or 8 | no NMI pending | `Unexpected` | stop |
 | VMCALL | `rax = 0x4e4d49` | `GuestNmiHandler` | advance RIP, resume |
 | VMCALL | `rax = 0xa1e0`, first main VMCALL | `MainVmcall` | advance RIP, resume |
 | VMCALL | `rax = 0xa1e1`, second main VMCALL | `LastMainVmcall` | stop: finished |
@@ -272,11 +342,13 @@ with `rcx = 0`: the loop ran out.
   exits right after the entry. If the guest stops right after an NMI exit,
   the CPU returns to firmware with NMIs blocked until the firmware's first
   interrupt handler runs `IRET`.
-- **The STI window loop.** If a CPU reported an NMI-window exit while STI
-  blocking still held, Aleph0 would keep deferring. No guest instruction
-  would run to end the STI shadow, so it would loop. Today's guest never
-  executes STI (IF = 0). Before an OS guest (`sti; hlt`), bound the deferrals
-  or inject once STI is the only blocker.
+- **The STI window loop** is gone: an NMI that only an STI shadow holds
+  back waits for the interrupt window, not the NMI window (section 5).
+  Host-tested only: the test guest never executes STI, and the firmware's
+  `sti; hlt` has not met an NMI on a recorded run yet. `sti; cli` leaves the
+  NMI pending until the guest's next exit.
+- **NMI blocking after a fault in IRET** is set again before resuming
+  (section 5). Host-tested only: neither guest's IRET faults today.
 - **Interrupted delivery** is now re-delivered. An exit whose IDT-vectoring
   info is valid interrupted an event the CPU was delivering through the
   guest IDT. `decide` judges the exit by its reason as usual; the handler
@@ -289,12 +361,25 @@ with `rcx = 0`: the loop ran out.
   synthesis yet). The test guest's case is the reinjected NMI whose delivery
   faults on the read-only stack page, as the CPU pushes the interrupt frame:
   an EPT violation whose IDT-vectoring field holds the NMI, so Aleph0 grants
-  write to the stack page and re-delivers the NMI. The remaining pieces of
-  this (the STI window above,
-  NMI blocking after a fault in IRET, external-interrupt passthrough) are
-  tracked in issue #26.
-- **Ordinary interrupts.** External-interrupt exiting comes with an OS guest
-  that runs with IF = 1.
+  write to the stack page and re-delivers the NMI. The report shows such an
+  exit with `during event delivery: IDT-vectoring info=…` and the
+  re-delivery with `re-delivering the interrupted event: entry interruption
+  info=…`.
+- **Ordinary interrupts pass straight through**, for the first OS boot
+  too. External-interrupt exiting stays off (the pin-based controls request
+  NMI exiting and virtual NMIs only), so an interrupt that arrives while
+  the guest runs goes through the guest's own IDT, with no VM exit. One
+  that arrives while Aleph0 runs stays pending: a VM exit leaves RFLAGS.IF
+  = 0 in root operation (`vmx/vmexit/mod.rs`), and Aleph0 executes no STI,
+  so the interrupt reaches the guest's IDT right after VMRESUME, if the
+  guest has IF = 1. Aleph0 therefore never injects an external interrupt,
+  and needs no APIC virtualization. One whose delivery itself exits (an
+  EPT violation on the guest's IDT or stack) is re-delivered like any
+  other event, above. This is the firmware guest's behaviour since #21:
+  its timer and Hyper-V's synthetic interrupts reach it this way
+  ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md)).
+- **No double-fault synthesis.** An exit whose own plan advances RIP or
+  injects an event while another is being re-delivered stops the guest.
 
 ## Cheat sheet
 
@@ -306,7 +391,12 @@ with `rcx = 0`: the loop ran out.
 | `interrupt_gate` | `guest.rs` | encodes a 64-bit interrupt gate |
 | `PIN_BASED_NMI_EXITING`, `PIN_BASED_VIRTUAL_NMIS` | `vmcs/fields.rs` | pin bits 3 and 5 |
 | `CPU_BASED_NMI_WINDOW_EXITING` | `vmcs/fields.rs` | primary bit 22 |
+| `CPU_BASED_INTERRUPT_WINDOW_EXITING` | `vmcs/fields.rs` | primary bit 2 |
 | `set_nmi_window_exiting` | `vmcs/mod.rs` | turns the NMI window on or off |
+| `set_interrupt_window_exiting` | `vmcs/mod.rs` | turns the interrupt window on or off |
+| `ResumePlan::WAIT_FOR_STI_SHADOW` | `exit_decision/mod.rs` | an NMI behind an STI shadow: interrupt window on, NMI window off |
+| `ExitInfo::faulted_nmi_unblocking_iret` | `exit_decision/mod.rs` | bit 12: the exit came from a fault in an NMI-unblocking IRET |
+| `ResumePlan::interruptibility` | `exit_decision/mod.rs` | `GUEST_INTERRUPTIBILITY_STATE` to resume with |
 | `InterruptionInfo::NMI` (`0x80000202`) | `exit_decision/mod.rs` | `VM_ENTRY_INTERRUPTION_INFO` value |
 | `decide` | `exit_decision/mod.rs` | the dispatch; the NMI, NMI-window and VMCALL rows of section 6 are the handlers in `scenario.rs` |
 | `-InjectNmi` | `scripts/run-hyperv.ps1` | one vCPU, `Debug-VM` NMI after VMCALL #1 |
