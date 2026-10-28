@@ -346,8 +346,8 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
     // any other exit.
     let cr_access_exit =
         decoded.is_some_and(|reason| !reason.entry_failure && reason.basic == EXIT_REASON_CONTROL_REGISTER);
-    // SAFETY: exit context implies VMX operation, so the FIXED MSRs exist.
     let cr_fixed = if cr_access_exit {
+        // SAFETY: exit context implies VMX operation, so the FIXED MSRs exist.
         unsafe { CrFixed::read() }
     } else {
         CrFixed::NONE
