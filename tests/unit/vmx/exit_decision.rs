@@ -289,9 +289,99 @@ fn second_violation_on_the_page_stops_with_the_violation() {
 }
 
 #[test]
-fn violation_during_nmi_unblocking_iret_stops_with_the_violation() {
+fn violation_during_nmi_unblocking_iret_is_granted_and_blocks_nmis_again() {
+    // The IRET had ended NMI blocking when its access faulted. The write is
+    // granted as any other, and the resume sets blocking by NMI again, so no
+    // NMI gets in before the IRET runs again.
     let iret = ept_violation(PROTECTED_PAGE, PROTECTED_WRITE | EPT_NMI_UNBLOCKING_IRET);
-    assert_eq!(decide(GuestKind::BuiltInTest, START, iret).0, ExitEvent::EptViolation);
+    let (event, state) = decide(GuestKind::BuiltInTest, START, iret);
+    assert_eq!((event, state), (ExitEvent::EptWriteGranted, WRITTEN));
+    let plan = match event.action() {
+        ExitAction::Resume(plan) => plan.restoring_nmi_blocking(&iret),
+        other => panic!("expected a resume, got {other:?}"),
+    };
+    assert_eq!(
+        plan,
+        ResumePlan {
+            restore_nmi_blocking: true,
+            ..ResumePlan::RETRY_AFTER_GRANT
+        }
+    );
+    assert_eq!(plan.interruptibility(0), BLOCKING_BY_NMI);
+}
+
+/// A #GP raised by an IRET that had ended NMI blocking, as
+/// VM_EXIT_INTERRUPTION_INFO reports it: valid, bit 12, error code, type 3,
+/// vector 13.
+const IRET_GP_INFO: InterruptionInfo = InterruptionInfo(0x8000_1B0D);
+
+#[test]
+fn bit_12_of_the_ept_qualification_or_the_interruption_info_marks_a_faulted_iret() {
+    let iret_violation = ept_violation(PROTECTED_PAGE, PROTECTED_WRITE | EPT_NMI_UNBLOCKING_IRET);
+    assert!(iret_violation.faulted_nmi_unblocking_iret());
+    let iret_gp = ExitInfo {
+        interruption_info: IRET_GP_INFO,
+        ..exit(EXIT_REASON_EXCEPTION_OR_NMI)
+    };
+    assert!(iret_gp.faulted_nmi_unblocking_iret());
+    // Without bit 12: any other EPT violation or exception.
+    assert!(!protected_write().faulted_nmi_unblocking_iret());
+    let page_fault = ExitInfo {
+        interruption_info: InterruptionInfo(PAGE_FAULT_INFO),
+        ..exit(EXIT_REASON_EXCEPTION_OR_NMI)
+    };
+    assert!(!page_fault.faulted_nmi_unblocking_iret());
+}
+
+#[test]
+fn bit_12_is_ignored_where_the_sdm_leaves_it_undefined() {
+    // During an event's delivery (IDT-vectoring valid).
+    let during_delivery = ExitInfo {
+        idt_vectoring: VECTORING_NMI,
+        ..ept_violation(PROTECTED_PAGE, PROTECTED_WRITE | EPT_NMI_UNBLOCKING_IRET)
+    };
+    assert!(!during_delivery.faulted_nmi_unblocking_iret());
+    // For a double fault: valid, bit 12, error code, type 3, vector 8.
+    let double_fault = ExitInfo {
+        interruption_info: InterruptionInfo(0x8000_1B08),
+        ..exit(EXIT_REASON_EXCEPTION_OR_NMI)
+    };
+    assert!(!double_fault.faulted_nmi_unblocking_iret());
+    // For an exit whose qualification has another layout.
+    let io = ExitInfo {
+        qualification: EPT_NMI_UNBLOCKING_IRET,
+        ..exit(EXIT_REASON_IO_INSTRUCTION)
+    };
+    assert!(!io.faulted_nmi_unblocking_iret());
+    // For a failed VM entry.
+    let failed = ExitInfo {
+        reason: ExitReason {
+            basic: EXIT_REASON_EPT_VIOLATION,
+            entry_failure: true,
+        },
+        ..iret_violation_on(PROTECTED_PAGE)
+    };
+    assert!(!failed.faulted_nmi_unblocking_iret());
+}
+
+/// An EPT violation at `page` during an IRET that ended NMI blocking.
+fn iret_violation_on(page: u64) -> ExitInfo {
+    ept_violation(page, PROTECTED_WRITE | EPT_NMI_UNBLOCKING_IRET)
+}
+
+#[test]
+fn only_a_faulted_iret_restores_nmi_blocking() {
+    for plan in [
+        ResumePlan::RETRY_AFTER_GRANT,
+        ResumePlan::INJECT_GP,
+        ResumePlan::PAST_INSTRUCTION,
+    ] {
+        assert!(!plan.restoring_nmi_blocking(&protected_write()).restore_nmi_blocking);
+        assert!(
+            plan.restoring_nmi_blocking(&iret_violation_on(PROTECTED_PAGE))
+                .restore_nmi_blocking
+        );
+    }
 }
 
 #[test]
@@ -445,13 +535,31 @@ fn nmi_while_unblocked_is_injected() {
 }
 
 #[test]
-fn nmi_while_blocked_by_sti_waits_for_the_window() {
-    // The SDM requires bit 0 to be 0 for an NMI injection, so STI blocking
-    // defers the NMI just like NMI blocking does.
+fn nmi_while_blocked_by_sti_alone_waits_past_the_shadow() {
+    // The SDM lets a processor require bit 0 to be 0 for an NMI injection, so
+    // STI blocking defers the NMI too, but behind the interrupt window: a CPU
+    // may report NMI-window exits inside the shadow.
     assert_eq!(
-        decide(GuestKind::BuiltInTest, WAITING, nmi(BLOCKING_BY_STI)).0,
-        ExitEvent::NmiDeferred
+        decide(GuestKind::BuiltInTest, WAITING, nmi(BLOCKING_BY_STI)),
+        (
+            ExitEvent::NmiDeferredPastSti,
+            ExitState {
+                nmi_pending: true,
+                ..WAITING
+            }
+        ),
     );
+}
+
+#[test]
+fn nmi_blocked_by_sti_and_more_waits_for_the_nmi_window() {
+    // Blocking by NMI or MOV SS as well: the NMI window waits for both.
+    for blocking in [BLOCKING_BY_STI | BLOCKING_BY_NMI, BLOCKING_BY_STI | BLOCKING_BY_MOV_SS] {
+        assert_eq!(
+            decide(GuestKind::BuiltInTest, WAITING, nmi(blocking)).0,
+            ExitEvent::NmiDeferred
+        );
+    }
 }
 
 #[test]
@@ -489,19 +597,97 @@ fn window_exit_injects_the_pending_nmi() {
 }
 
 #[test]
-fn window_exit_while_still_blocked_keeps_waiting() {
+fn window_exit_inside_an_sti_shadow_waits_for_the_interrupt_window() {
+    // A CPU that reports NMI-window exits under STI blocking would exit at
+    // the same instruction forever if the NMI window stayed on: wait for the
+    // interrupt window instead, with the NMI window off.
+    let pending = ExitState {
+        nmi_pending: true,
+        ..WAITING
+    };
+    let in_shadow = ExitInfo {
+        interruptibility: BLOCKING_BY_STI,
+        ..exit(EXIT_REASON_NMI_WINDOW)
+    };
+    let (event, next) = decide(GuestKind::BuiltInTest, pending, in_shadow);
+    assert_eq!((event, next), (ExitEvent::NmiDeferredPastSti, pending));
+    assert_eq!(event.action(), ExitAction::Resume(ResumePlan::WAIT_FOR_STI_SHADOW));
+    // The NMI is still pending, but the window stays off.
+    assert_eq!(
+        ResumePlan::WAIT_FOR_STI_SHADOW.keeping_pending_nmi(next),
+        ResumePlan::WAIT_FOR_STI_SHADOW
+    );
+}
+
+#[test]
+fn window_exit_while_blocked_by_nmi_keeps_waiting() {
     let pending = ExitState {
         nmi_pending: true,
         ..WAITING
     };
     let still_blocked = ExitInfo {
-        interruptibility: BLOCKING_BY_STI,
+        interruptibility: BLOCKING_BY_NMI,
         ..exit(EXIT_REASON_NMI_WINDOW)
     };
     assert_eq!(
         decide(GuestKind::BuiltInTest, pending, still_blocked),
         (ExitEvent::NmiDeferred, pending)
     );
+}
+
+#[test]
+fn interrupt_window_exit_injects_the_pending_nmi() {
+    let pending = ExitState {
+        nmi_pending: true,
+        ..WAITING
+    };
+    let (event, next) = decide(GuestKind::BuiltInTest, pending, exit(EXIT_REASON_INTERRUPT_WINDOW));
+    assert_eq!((event, next), (ExitEvent::InterruptWindowInjected, WAITING));
+    // Both windows off.
+    assert_eq!(event.action(), ExitAction::Resume(ResumePlan::INJECT_NMI));
+}
+
+#[test]
+fn interrupt_window_exit_while_blocked_by_nmi_waits_for_the_nmi_window() {
+    let pending = ExitState {
+        nmi_pending: true,
+        ..WAITING
+    };
+    let blocked = ExitInfo {
+        interruptibility: BLOCKING_BY_NMI,
+        ..exit(EXIT_REASON_INTERRUPT_WINDOW)
+    };
+    let (event, next) = decide(GuestKind::BuiltInTest, pending, blocked);
+    assert_eq!((event, next), (ExitEvent::NmiDeferred, pending));
+    // The interrupt window goes off, the NMI window on.
+    assert_eq!(event.action(), ExitAction::Resume(ResumePlan::WAIT_FOR_NMI_WINDOW));
+}
+
+#[test]
+fn interrupt_window_exit_without_a_pending_nmi_is_unexpected() {
+    assert_eq!(
+        decide(GuestKind::BuiltInTest, WAITING, exit(EXIT_REASON_INTERRUPT_WINDOW)),
+        (ExitEvent::Unexpected, WAITING)
+    );
+}
+
+#[test]
+fn an_nmi_in_an_sti_shadow_reaches_the_firmware_once_the_shadow_ends() {
+    // `sti; hlt` with the firmware's IF = 1: the NMI exit comes inside the
+    // shadow, waits behind the interrupt window, and is injected at it.
+    let mut state = START;
+    let mut events = [ExitEvent::Unexpected; 2];
+    for (slot, exit) in events
+        .iter_mut()
+        .zip([nmi(BLOCKING_BY_STI), exit(EXIT_REASON_INTERRUPT_WINDOW)])
+    {
+        (*slot, state) = decide(GuestKind::Firmware, state, exit);
+    }
+    assert_eq!(
+        events,
+        [ExitEvent::NmiDeferredPastSti, ExitEvent::InterruptWindowInjected]
+    );
+    assert_eq!(state, START);
 }
 
 #[test]
@@ -842,29 +1028,45 @@ fn exception_exit_is_unexpected() {
 
 #[test]
 fn each_event_maps_to_its_action() {
-    let resume = |advance_rip, inject_nmi, nmi_window, grant_write| {
+    let resume = |advance_rip, inject_nmi, nmi_window, interrupt_window, grant_write| {
         ExitAction::Resume(ResumePlan {
             advance_rip,
             inject_nmi,
             nmi_window,
+            interrupt_window,
             grant_write,
             emulate: None,
             inject_exception: None,
             redeliver: None,
             clear_nmi_blocking: false,
+            restore_nmi_blocking: false,
             write_cr: None,
         })
     };
-    assert_eq!(ExitEvent::MainVmcall.action(), resume(true, false, None, false));
-    assert_eq!(ExitEvent::GuestNmiHandler.action(), resume(true, false, None, false));
-    assert_eq!(ExitEvent::NmiInjected.action(), resume(false, true, Some(false), false));
+    assert_eq!(ExitEvent::MainVmcall.action(), resume(true, false, None, None, false));
     assert_eq!(
-        ExitEvent::NmiWindowInjected.action(),
-        resume(false, true, Some(false), false)
+        ExitEvent::GuestNmiHandler.action(),
+        resume(true, false, None, None, false)
     );
-    assert_eq!(ExitEvent::NmiDeferred.action(), resume(false, false, Some(true), false));
+    // Injecting turns both windows off, whichever one was waiting.
+    let inject = resume(false, true, Some(false), Some(false), false);
+    assert_eq!(ExitEvent::NmiInjected.action(), inject);
+    assert_eq!(ExitEvent::NmiWindowInjected.action(), inject);
+    assert_eq!(ExitEvent::InterruptWindowInjected.action(), inject);
+    assert_eq!(
+        ExitEvent::NmiDeferred.action(),
+        resume(false, false, Some(true), Some(false), false)
+    );
+    // Behind an STI shadow alone: the interrupt window instead of the NMI one.
+    assert_eq!(
+        ExitEvent::NmiDeferredPastSti.action(),
+        resume(false, false, Some(false), Some(true), false)
+    );
     // RIP not advanced: the write runs again once the page is writable.
-    assert_eq!(ExitEvent::EptWriteGranted.action(), resume(false, false, None, true));
+    assert_eq!(
+        ExitEvent::EptWriteGranted.action(),
+        resume(false, false, None, None, true)
+    );
     assert_eq!(ExitEvent::LastMainVmcall.action(), ExitAction::Finished);
     assert_eq!(ExitEvent::EptWriteMissing.action(), ExitAction::Unexpected);
     assert_eq!(ExitEvent::DataPageMismatch.action(), ExitAction::Unexpected);
@@ -911,6 +1113,33 @@ fn hlt_in_an_sti_shadow_is_decided_the_same() {
         ..exit(EXIT_REASON_HLT)
     };
     assert_eq!(decide(GuestKind::BuiltInTest, START, in_shadow).0, ExitEvent::Halted);
+}
+
+#[test]
+fn the_resume_interruptibility_follows_the_plan() {
+    let everything = BLOCKING_BY_STI | BLOCKING_BY_MOV_SS | BLOCKING_BY_NMI;
+    // Nothing to change.
+    assert_eq!(ResumePlan::RETRY_AFTER_GRANT.interruptibility(everything), everything);
+    // Advancing RIP ends STI and MOV SS blocking, keeps blocking by NMI.
+    assert_eq!(
+        ResumePlan::PAST_INSTRUCTION.interruptibility(everything),
+        BLOCKING_BY_NMI
+    );
+    // An NMI re-delivery clears blocking by NMI.
+    let redelivering = ResumePlan {
+        clear_nmi_blocking: true,
+        ..ResumePlan::RETRY_AFTER_GRANT
+    };
+    assert_eq!(redelivering.interruptibility(BLOCKING_BY_NMI), 0);
+    // A faulted NMI-unblocking IRET sets it again and keeps the rest.
+    let restoring = ResumePlan {
+        restore_nmi_blocking: true,
+        ..ResumePlan::RETRY_AFTER_GRANT
+    };
+    assert_eq!(
+        restoring.interruptibility(BLOCKING_BY_STI),
+        BLOCKING_BY_STI | BLOCKING_BY_NMI
+    );
 }
 
 #[test]

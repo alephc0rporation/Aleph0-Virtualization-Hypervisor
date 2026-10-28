@@ -4,6 +4,8 @@
 //! Like the handler, everything here runs in exit context: only VMREAD and
 //! the serial port, never firmware.
 
+use core::fmt;
+
 use super::guest_mtrrs::{self, MtrrWrite};
 use super::handler::{EmulationOutcome, ExitRead, Outcome, Resumed};
 use super::policy::{COUNTERS, Detail, Histogram};
@@ -13,7 +15,7 @@ use crate::vmx::ept::{Eptp, InveptType, Retyped};
 use crate::vmx::exit_decision::{
     CrQualification, CrWrite, EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EXCEPTION_OR_NMI, EXIT_REASON_RDMSR,
     EXIT_REASON_VMCALL, EXIT_REASON_WRMSR, EptQualification, ExitEvent, ExitInfo, ExitState, InterruptionInfo,
-    PLANNED_MAIN_VMCALLS, exit_reason_name, expected_main_rax, wrmsr_value,
+    PLANNED_MAIN_VMCALLS, ResumePlan, exit_reason_name, expected_main_rax, wrmsr_value,
 };
 use crate::vmx::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE};
 use crate::vmx::hyperv;
@@ -89,7 +91,10 @@ pub(super) fn report_exit(report: &ExitReport<'_>) {
         report_host_nmi(number);
     }
     match outcome {
-        Outcome::Resumed { resumed, .. } => report_event(guest, number, event, read.exit, next, Some(resumed)),
+        Outcome::Resumed { plan, resumed } => {
+            report_event(guest, number, event, read.exit, next, Some(resumed));
+            report_interrupt_state(number, plan, read.exit);
+        }
         Outcome::ResumeFailed(failure) => {
             crate::serial_println!("{tag} VM exit #{number}: {failure}; not resuming.")
         }
@@ -165,7 +170,15 @@ fn report_read(number: u64, read: &ExitRead) {
     );
     report_unreadable(number, "VM_EXIT_INTERRUPTION_INFO", read.interruption_info);
     report_unreadable(number, "GUEST_INTERRUPTIBILITY_STATE", read.interruptibility);
-    report_unreadable(number, "IDT_VECTORING_INFO", read.idt_vectoring);
+    match read.idt_vectoring.map(|info| InterruptionInfo(info as u32)) {
+        Ok(vectoring) if vectoring.is_valid() => crate::serial_println!(
+            "{tag} VM exit #{number}: during event delivery: IDT-vectoring info={:#010x} error code={:#x}",
+            vectoring.0,
+            read.exit.map_or(0, |exit| exit.idt_vectoring_error_code),
+        ),
+        Ok(_) => {}
+        Err(_) => report_unreadable(number, "IDT_VECTORING_INFO", read.idt_vectoring),
+    }
     if let Some(rights) = read.ss_access_rights {
         report_unreadable(number, "GUEST_SS_ACCESS_RIGHTS", rights);
     }
@@ -295,6 +308,45 @@ pub(super) fn report_stop(number: u64, frame: &RegisterFrame, exits_by_reason: &
     history::report(format_args!("VM exit #{number}"));
 }
 
+/// `, {name}={value:#x}` for a field that is there; nothing otherwise.
+struct OptionalField(&'static str, Option<u32>);
+
+impl fmt::Display for OptionalField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.1 {
+            Some(value) => write!(f, ", {}={value:#x}", self.0),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Prints, after the event line of exit `number`, what its resume `plan`
+/// does to the guest's events besides the event itself: the event the exit
+/// interrupted, re-delivered, and blocking by NMI set again after a fault in
+/// an NMI-unblocking IRET. Nothing for a plan that does neither.
+fn report_interrupt_state(number: u64, plan: ResumePlan, exit: Option<ExitInfo>) {
+    let tag = crate::TAG;
+    if let Some(redelivery) = plan.redeliver {
+        crate::serial_println!(
+            "{tag} VM exit #{number}: re-delivering the interrupted event: entry interruption info={:#010x}{}{}{}.",
+            redelivery.info.0,
+            OptionalField("error code", redelivery.error_code),
+            OptionalField("instruction length", redelivery.instruction_len),
+            if plan.clear_nmi_blocking {
+                ", blocking by NMI cleared"
+            } else {
+                ""
+            },
+        );
+    }
+    if plan.restore_nmi_blocking {
+        crate::serial_println!(
+            "{tag} VM exit #{number}: the exit came from a fault in an IRET that had ended NMI blocking; blocking by NMI set again (interruptibility={:#x}).",
+            plan.interruptibility(exit.map_or(0, |exit| exit.interruptibility)),
+        );
+    }
+}
+
 /// Prints what exit `number` of `guest` turned out to be and what Aleph0
 /// does about it. `state` is the state after the exit; `resumed` is how the
 /// guest goes on, for events that resume it.
@@ -361,8 +413,15 @@ fn report_event(
             "{tag} VM exit #{number}: NMI cannot be injected yet (interruptibility={:#x}); waiting for the NMI window.",
             exit.map_or(0, |exit| exit.interruptibility),
         ),
+        ExitEvent::NmiDeferredPastSti => crate::serial_println!(
+            "{tag} VM exit #{number}: NMI held back by an STI shadow only (interruptibility={:#x}); waiting for the interrupt window, NMI-window exiting off.",
+            exit.map_or(0, |exit| exit.interruptibility),
+        ),
         ExitEvent::NmiWindowInjected => crate::serial_println!(
             "{tag} VM exit #{number}: NMI window open; reinjecting the pending NMI at rip={rip:#018x}."
+        ),
+        ExitEvent::InterruptWindowInjected => crate::serial_println!(
+            "{tag} VM exit #{number}: interrupt window open, the STI shadow has ended; reinjecting the pending NMI at rip={rip:#018x}."
         ),
         ExitEvent::LastMainVmcall if nmis_injected == 0 && state.nmis_handled == 0 && !state.nmi_pending => {
             crate::serial_println!(

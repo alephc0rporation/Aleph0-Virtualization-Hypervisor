@@ -378,8 +378,8 @@ directory of its own; it is not part of the repository.
   VMBus drivers post a message (`0x5c`), zero the synthetic timers and mask
   the SINTs, all forwarded ([RESIDENT.md](RESIDENT.md) section 7).
 - **Synthetic interrupts:** with external-interrupt exiting off, Hyper-V's
-  interrupts reach the guest's IDT directly (the firmware timer above); the
-  interrupt policy is #26.
+  interrupts reach the guest's IDT directly (the firmware timer above), and
+  stay that way for an OS ([NMI.md](NMI.md) section 8, #26).
 - **The CPUID bits that follow the guest's CR4 and secondary controls:** #25.
 
 ## Cheat sheet

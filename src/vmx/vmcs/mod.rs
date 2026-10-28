@@ -212,6 +212,9 @@ pub enum VmcsError {
     /// The CPU does not allow NMI-window exiting, which the exit handler
     /// needs to inject an NMI that arrived while the guest blocked NMIs.
     NmiWindowExitingUnsupported,
+    /// The CPU does not allow interrupt-window exiting, which the exit
+    /// handler needs to inject an NMI held back by an STI shadow.
+    InterruptWindowExitingUnsupported,
 }
 
 impl From<VmxFail> for VmcsError {
@@ -401,8 +404,10 @@ fn fall_through_failure(rflags: u64, clear: VmcsError) -> VmcsError {
 /// and the IA32_PAT switch when the CPU allows it ([`pat_switch`]).
 /// Also zeroes the counts and fields VM entry checks, and writes
 /// `desired.exception_bitmap`. It also checks that the CPU
-/// allows NMI-window exiting (`VmcsError::NmiWindowExitingUnsupported`
-/// otherwise), which the exit handler switches on at run time.
+/// allows NMI-window and interrupt-window exiting
+/// (`VmcsError::NmiWindowExitingUnsupported` or
+/// `VmcsError::InterruptWindowExitingUnsupported` otherwise), which the exit
+/// handler switches on at run time.
 ///
 /// # Safety
 ///
@@ -419,6 +424,11 @@ pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: Desire
     // injection (`set_nmi_window_exiting`), but the CPU must allow it.
     if !capabilities.primary.allows(CPU_BASED_NMI_WINDOW_EXITING) {
         return Err(VmcsError::NmiWindowExitingUnsupported);
+    }
+    // Likewise interrupt-window exiting, switched on only while an STI shadow
+    // holds back a pending NMI (`set_interrupt_window_exiting`).
+    if !capabilities.primary.allows(CPU_BASED_INTERRUPT_WINDOW_EXITING) {
+        return Err(VmcsError::InterruptWindowExitingUnsupported);
     }
     let (pat_exit, pat_entry) = pat_switch(capabilities);
     let exit = capabilities
@@ -595,10 +605,22 @@ pub unsafe fn configure_host_entry(stack_top: u64, entry_address: u64) -> Result
     Ok(())
 }
 
+/// `primary` with the primary control `bit` turned on or off, other bits
+/// unchanged.
+fn with_primary_control(primary: u64, bit: u32, on: bool) -> u64 {
+    let bit = u64::from(bit);
+    if on { primary | bit } else { primary & !bit }
+}
+
 /// `primary` with NMI-window exiting turned on or off, other bits unchanged.
 fn with_nmi_window_exiting(primary: u64, on: bool) -> u64 {
-    let bit = u64::from(CPU_BASED_NMI_WINDOW_EXITING);
-    if on { primary | bit } else { primary & !bit }
+    with_primary_control(primary, CPU_BASED_NMI_WINDOW_EXITING, on)
+}
+
+/// `primary` with interrupt-window exiting turned on or off, other bits
+/// unchanged.
+fn with_interrupt_window_exiting(primary: u64, on: bool) -> u64 {
+    with_primary_control(primary, CPU_BASED_INTERRUPT_WINDOW_EXITING, on)
 }
 
 /// Turns NMI-window exiting on or off in the current VMCS. The exit handler
@@ -615,6 +637,23 @@ pub unsafe fn set_nmi_window_exiting(on: bool) -> Result<(), VmcsError> {
     // SAFETY: the caller guarantees VMX operation with a current VMCS. Only
     // the NMI-window bit changes, which the caller checked the CPU allows.
     unsafe { vmwrite(PRIMARY_VM_EXEC_CONTROL, with_nmi_window_exiting(primary, on)) }
+}
+
+/// Turns interrupt-window exiting on or off in the current VMCS. The exit
+/// handler turns it on while an STI shadow holds back a pending NMI, and off
+/// once the NMI is injected or waits for the NMI window instead.
+///
+/// # Safety
+///
+/// VMX operation with a current VMCS. `configure_controls` has checked that
+/// the CPU allows the bit.
+pub unsafe fn set_interrupt_window_exiting(on: bool) -> Result<(), VmcsError> {
+    // SAFETY: the caller guarantees VMX operation with a current VMCS.
+    let primary = unsafe { vmread(PRIMARY_VM_EXEC_CONTROL)? };
+    // SAFETY: the caller guarantees VMX operation with a current VMCS. Only
+    // the interrupt-window bit changes, which the caller checked the CPU
+    // allows.
+    unsafe { vmwrite(PRIMARY_VM_EXEC_CONTROL, with_interrupt_window_exiting(primary, on)) }
 }
 
 /// Writes the CR0/CR4 guest/host masks and read shadows, reading each back.
