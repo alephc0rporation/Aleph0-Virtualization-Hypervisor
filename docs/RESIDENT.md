@@ -218,7 +218,8 @@ except after `BootServicesEnded`, which it resumes in `Runtime` for good
 skip the firmware console, which is gone, and write serial only. A stop
 already halts for the firmware guest (`FIRMWARE_GUEST.md`, section 3), so it
 does so after `ExitBootServices` too, with no jump into `vmx_launch`'s frame;
-the OS-mode stop policy is #28.
+#28 kept that as the OS-mode stop policy, and a stop in the Linux guest
+showed it ([LINUX_GUEST.md](LINUX_GUEST.md) section 8).
 
 Serial needs nothing else: its state (`READY`, `PORT`) is in the copy.
 

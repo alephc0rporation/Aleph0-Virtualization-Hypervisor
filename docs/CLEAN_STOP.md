@@ -299,7 +299,8 @@ with ABORTED.`
   the guest's own IDT; see NMI.md.
 - After `ExitBootServices` Aleph0 must stay resident instead of returning
   ([RESIDENT.md](RESIDENT.md)). A stop then halts, as it does for the
-  firmware guest; the OS-mode stop policy is #28.
+  firmware guest, and #28 kept that as the OS-mode stop policy: the report
+  on COM2, then a halted CPU ([LINUX_GUEST.md](LINUX_GUEST.md) section 8).
 - All of this is the test guest's path, the regression mode (Cargo feature
   `test-guest`). A default build virtualizes the firmware in place, which
   has no stop to return from: a stop of the firmware halts after its report,

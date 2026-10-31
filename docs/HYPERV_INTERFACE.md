@@ -373,7 +373,10 @@ directory of its own; it is not part of the repository.
   (`hyperv::hypercall_gpas`, `hyperv::overlay_gpa`, `page::is_resident`) and
   refuses it with #GP at the guest's instruction, instead of forwarding, so
   the guest cannot aim Hyper-V at Aleph0's pages even once they are hidden.
-- **Whether Linux boots on the forwarded interface:** #28. The harness of
+- **Whether Linux boots on the forwarded interface:** it does (#28,
+  [LINUX_GUEST.md](LINUX_GUEST.md) section 8): `Hypervisor detected:
+  Microsoft Hyper-V`, clocksource `tsc`, and its synthetic MSR reads and
+  writes forwarded. The harness of
   #23 now gets through `ExitBootServices`, during which the firmware's
   VMBus drivers post a message (`0x5c`), zero the synthetic timers and mask
   the SINTs, all forwarded ([RESIDENT.md](RESIDENT.md) section 7).

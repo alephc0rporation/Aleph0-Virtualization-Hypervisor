@@ -11,7 +11,7 @@ use crate::vmx::exit_decision::UNREADABLE_REASON;
 /// guest, in a build printing up to `max_level`.
 fn details(last: u64, max_level: Level) -> Vec<Detail> {
     (1..=last)
-        .map(|count| exit_detail(count, false, false, max_level))
+        .map(|count| exit_detail(count, false, false, false, max_level))
         .collect()
 }
 
@@ -27,7 +27,7 @@ fn the_first_exits_of_a_reason_print_in_full() {
 #[test]
 fn after_the_first_exits_only_powers_of_two_print_a_summary() {
     let printed: Vec<(u64, Detail)> = (FULL_EXITS_PER_REASON + 1..=4096)
-        .map(|count| (count, exit_detail(count, false, false, Level::Info)))
+        .map(|count| (count, exit_detail(count, false, false, false, Level::Info)))
         .filter(|&(_, detail)| detail != Detail::Silent)
         .collect();
     let summaries: Vec<u64> = printed.iter().map(|&(count, _)| count).collect();
@@ -39,7 +39,7 @@ fn after_the_first_exits_only_powers_of_two_print_a_summary() {
 fn a_stop_always_prints_in_full() {
     for count in [1, 17, 33, 1_000_000] {
         assert_eq!(
-            exit_detail(count, true, false, Level::Info),
+            exit_detail(count, true, false, false, Level::Info),
             Detail::Full,
             "count {count}"
         );
@@ -48,7 +48,19 @@ fn a_stop_always_prints_in_full() {
 
 #[test]
 fn an_unreadable_field_always_prints_in_full() {
-    assert_eq!(exit_detail(33, false, true, Level::Info), Detail::Full);
+    assert_eq!(exit_detail(33, false, true, false, Level::Info), Detail::Full);
+}
+
+#[test]
+fn a_milestone_prints_in_full_past_the_rate_limit() {
+    // The Linux run's ExitBootServices VMCALL came after 31 hypercalls.
+    for count in [17, 32, 33, 1_000_000] {
+        assert_eq!(
+            exit_detail(count, false, false, true, Level::Info),
+            Detail::Full,
+            "count {count}"
+        );
+    }
 }
 
 #[test]
@@ -68,7 +80,7 @@ fn the_test_guest_runs_print_every_exit_in_full() {
         for (number, &basic) in run.iter().enumerate() {
             counts[counter(basic)] += 1;
             let stops = number == run.len() - 1;
-            let detail = exit_detail(counts[counter(basic)], stops, false, MAX_LEVEL);
+            let detail = exit_detail(counts[counter(basic)], stops, false, false, MAX_LEVEL);
             assert_eq!(detail, Detail::Full, "exit #{}", number + 1);
         }
     }

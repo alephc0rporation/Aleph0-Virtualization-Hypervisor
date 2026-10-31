@@ -141,8 +141,11 @@ lines carry their time since boot (`CONFIG_PRINTK_TIME`); `/init`'s do not.
 
 `run-hyperv.ps1` takes three parameters for it:
 
-- `-Kernel <path>` copies the image to `\EFI\aleph0\linux.efi` on the ESP,
-  next to Aleph0's `\EFI\BOOT\BOOTX64.EFI`.
+- `-Kernel <path>` copies the image to `\EFI\aleph0\linux.efi` on the ESP.
+  With Aleph0, the OS loader (`tools/os-loader`) becomes
+  `\EFI\BOOT\BOOTX64.EFI` and Aleph0 `\EFI\BOOT\aleph0.efi`: the loader
+  starts Aleph0, then the kernel as its guest (section 8). It refuses
+  `-TestGuest` and `-InjectNmi`, whose build has no firmware guest.
 - `-WithoutAleph0` puts the kernel at `\EFI\BOOT\BOOTX64.EFI` instead of
   Aleph0, so the firmware boots it directly, and skips building Aleph0. It
   needs `-Kernel`, and refuses `-InjectNmi`, whose job waits for a line only
@@ -251,10 +254,108 @@ What the lines say:
   virtualization, `vmx`, `ept` and `vpid`.
 - **Time.** About 0.43 s of kernel time to `/init`, and 0.64 s at the shell.
 
-## 7. What is not covered yet
+## 8. Under Aleph0 (#28)
 
-- Starting this image under Aleph0, by returning to the boot manager or by
-  LoadImage/StartImage of `\EFI\aleph0\linux.efi`: #28.
+The same image boots as Aleph0's guest through a small loader,
+`tools/os-loader`, the ESP's `BOOTX64.EFI`:
+
+1. It loads `\EFI\BOOT\aleph0.efi` with `LoadImage` and starts it with
+   `StartImage`, the pattern of the #23 harness. Aleph0 virtualizes the
+   firmware in place and returns, so the loader goes on as its guest; it
+   checks that CPUID hides VMX.
+2. It loads `\EFI\aleph0\linux.efi` the same way and starts it. The kernel's
+   EFI stub calls `ExitBootServices` itself, and Aleph0's event tells it so.
+
+Aleph0 never learns what boots next: the boot path is the loader's. The two
+paths are fixed, as the runner stages them, so the loader has no choice to
+make. The kernel keeps its built-in command line, so the runs with and
+without Aleph0 differ only in Aleph0.
+
+```powershell
+.\scripts\run-hyperv.ps1 -Kernel run\linux\linux.efi -ProcessorCount 1
+```
+
+A stop in this mode does not return: there is no firmware to return to, and
+the OS owns the machine. The exit handler prints the reason, the guest-state
+dump, the last exits and the histogram on COM2 and halts the CPU with
+interrupts off (`GuestKind::Firmware`, `stop_returns_to_bring_up`, since
+#21); a triple fault or a VM-entry failure is an unexpected exit and takes
+the same path. The VM stays frozen for inspection.
+
+### The Hyper-V run (2026-10-31)
+
+COM1 (`run\guest-serial.log`), the marker lines:
+
+```text
+[os-loader] starting Aleph0 from \EFI\BOOT\aleph0.efi.
+[os-loader] Aleph0 returned SUCCESS; the loader runs as its guest (CPUID hides VMX).
+[os-loader] starting the kernel from \EFI\aleph0\linux.efi.
+[    0.000000] Linux version 6.18.58 (root@DESKTOP-HSQ4ND5) ... #3 SMP PREEMPT_DYNAMIC Sat Oct 24 16:45:20 EEST 2026
+[    0.000000] Hypervisor detected: Microsoft Hyper-V
+[    0.139025] Kernel command line: console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 nokaslr
+[    0.336276] clocksource: Switched to clocksource tsc
+[    0.428588] Run /init as init process
+aleph0-linux: init
+aleph0-linux: nproc 1
+aleph0-linux: cmdline console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 nokaslr
+aleph0-linux: clocksource tsc
+aleph0-linux: uptime 0.61 0.00
+aleph0-linux: shell
+```
+
+COM2 (`run\serial.log`), after Aleph0's bring-up:
+
+```text
+ExitBootServices event created: its VMCALL will tell Aleph0 when boot services end.
+VM exit #110085: VMCALL from Aleph0's ExitBootServices event (rcx=0x416c657068304542): boot services are over; output phase now runtime (serial only); going on at rip=0x000000007e96fd3a.
+VM exit #110086: forwarded to Hyper-V so far: hypercalls by call code: 0x5d=30 0x5c=1.
+VM exit #110649: XSETBV XCR0 <- 0x7; resuming at rip=0xffffffff812b39c8.
+VM exit #110658: XSETBV XCR0 <- 0x7; resuming at rip=0xffffffff812b39c8.
+VM exit #16779127: reason=12 (HLT), 16777216 exits of this reason so far.
+```
+
+- **The same boot.** The marker lines match the baseline's (section 6), in
+  the same order, after the loader's three. `Run /init as init process` came
+  at 0.428588 s and 0.431166 s in the two runs, against 0.426670 s and
+  0.428960 s without Aleph0; `/proc/uptime` read 0.61 s at the shell, against
+  0.63 s and 0.64 s. Inside the guest the kernel cannot see the time Aleph0's
+  exits take: the TSC keeps running for both.
+- **Hyper-V.** `Hypervisor detected: Microsoft Hyper-V` and clocksource
+  `tsc`, as without Aleph0, which is #27's decision: the guest keeps Hyper-V's
+  interface, and Aleph0 forwards it.
+- **ExitBootServices.** The signal came at exit #110085, after 31 hypercalls
+  of the firmware's VMBus teardown, past the 16 VMCALLs printed in full. In
+  the first run the rate limit hid its line (only the VMCALL count showed it:
+  32 VMCALLs, 31 of them forwarded), so it now prints in full whatever its
+  count (`vmexit::policy`, a milestone).
+- **XSETBV** (#25). The kernel's FPU set-up wrote XCR0 = `0x7` (x87, SSE,
+  AVX) twice, from `0xffffffff812b39c5`, and Aleph0 ran it in root operation.
+- **No stop.** About 113 s of uptime and 16.8 million exits, nearly all HLT
+  from the idle shell, of reasons 10, 12, 18, 31, 32 and 55 only.
+
+### A deliberate stop
+
+With `-Features os-stop-test`, XSETBV is an exit Aleph0 does not handle.
+Only the kernel runs it, so the stop comes after `ExitBootServices`
+(exit #123101), in the runtime phase:
+
+```text
+VM exit #123665: reason=55 (XSETBV)
+VM exit #123665: NOT an exit Aleph0 handles for the firmware.
+VM exit #123665: stopping the guest; halting: the firmware has nothing to return to.
+VM exit #123665: guest rip=0xffffffff812b39c5 rsp=0xffffffff82c03e70 rflags=0x246 cr0=0x80050033 cr3=0x2c30001 cr4=0xb72ef0
+VM exit #123665: exit statistics: exits=123665 cpuid_exits=1272 xsetbv_exits=0 ... mtrr_read_exits=100 mtrr_write_exits=2 ... halt_exits=121736 ... hypercall_exits=31 synthetic_read_exits=492 synthetic_write_exits=30.
+VM exit #123665: exits by reason: 10 (CPUID)=1272, 12 (HLT)=121736, 18 (VMCALL)=32, 31 (RDMSR)=592, 32 (WRMSR)=32, 55 (XSETBV)=1.
+```
+
+The dump shows the kernel's own state (its GDT and IDT at `0xfffffe...`,
+CR4 with OSXSAVE), then the registers and the last 64 exits; COM1 stops in
+the middle of the kernel's boot messages, and the VM stays running, halted,
+with nothing returned to. The statistics also show that the kernel reads and
+writes its MTRRs (100 reads, 2 writes), which reach the guest's copy (#14).
+
+## 9. What is not covered yet
+
 - A kernel built without Hyper-V guest support, for the "do not advertise
   Hyper-V" option, was booted for #27 (a copy of `scripts/linux/` with
   `# CONFIG_HYPERVISOR_GUEST is not set`): it reaches its shell, on

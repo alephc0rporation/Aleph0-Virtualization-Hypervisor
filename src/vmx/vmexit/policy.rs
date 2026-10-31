@@ -9,6 +9,7 @@
 //! | Exit | Level | Detail in the default build |
 //! |---|---|---|
 //! | stops the guest, or a VMCS field could not be read | error | in full |
+//! | a milestone (the `ExitBootServices` VMCALL), whatever its count | info | in full |
 //! | one of the first [`FULL_EXITS_PER_REASON`] of its reason | info | in full |
 //! | the 32nd, 64th, 128th, ... of its reason | info | one summary line |
 //! | any other | trace | nothing |
@@ -60,11 +61,14 @@ pub enum Detail {
 
 /// How much of an exit to print: exit `count` of its reason (1 for the
 /// first), which `stops` the guest or not, with an `unreadable` VMCS field or
-/// not, in a build that prints up to `max_level` ([`MAX_LEVEL`]).
-pub fn exit_detail(count: u64, stops: bool, unreadable: bool, max_level: Level) -> Detail {
+/// not, a `milestone` or not, in a build that prints up to `max_level`
+/// ([`MAX_LEVEL`]). A milestone is an exit a run is read by, such as the
+/// `ExitBootServices` VMCALL: an OS's EFI stub makes it after dozens of
+/// hypercalls, past the full-print window of its reason.
+pub fn exit_detail(count: u64, stops: bool, unreadable: bool, milestone: bool, max_level: Level) -> Detail {
     let level = if stops || unreadable {
         Level::Error
-    } else if count <= FULL_EXITS_PER_REASON {
+    } else if milestone || count <= FULL_EXITS_PER_REASON {
         Level::Info
     } else {
         Level::Trace

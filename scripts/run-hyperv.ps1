@@ -57,8 +57,11 @@
 
 .PARAMETER Kernel
     A Linux EFI image, such as run\linux\linux.efi from
-    scripts/linux/build.sh, to put on the ESP as \EFI\aleph0\linux.efi, next
-    to Aleph0.
+    scripts/linux/build.sh, to boot as Aleph0's guest: it goes on the ESP as
+    \EFI\aleph0\linux.efi, the OS loader (tools/os-loader) becomes
+    \EFI\BOOT\BOOTX64.EFI, and Aleph0 goes next to it as
+    \EFI\BOOT\aleph0.efi. The loader starts Aleph0, then the kernel as its
+    guest. Its lines and the kernel's console are COM1, run\guest-serial.log.
 
 .PARAMETER WithoutAleph0
     Boots the -Kernel image directly: it becomes \EFI\BOOT\BOOTX64.EFI in
@@ -105,6 +108,9 @@ $root         = Split-Path -Parent $PSScriptRoot   # this script lives in script
 $buildProfile = if ($Release) { "release" } else { "debug" }
 $efiSrc       = Join-Path $root "target\x86_64-unknown-uefi\$buildProfile\aleph0hypervisor.efi"
 $harnessSrc   = Join-Path $root "target\x86_64-unknown-uefi\$buildProfile\ebs-harness.efi"
+$loaderSrc    = Join-Path $root "target\x86_64-unknown-uefi\$buildProfile\os-loader.efi"
+# With -Kernel and Aleph0, the loader boots: it starts Aleph0, then the kernel.
+$withLoader   = $Kernel -and -not $WithoutAleph0
 $runDir       = Join-Path $root "run"
 $vhdPath      = Join-Path $runDir "aleph0-esp.vhdx"
 
@@ -164,6 +170,11 @@ if ($Harness -and ($TestGuest -or $InjectNmi -or $Kernel)) {
     Write-Error "-Harness needs the firmware build of Aleph0, or none with -WithoutAleph0; do not combine it with -TestGuest, -InjectNmi or -Kernel."
     exit 1
 }
+# The loader checks that it runs as the guest of the firmware build.
+if ($Kernel -and -not $WithoutAleph0 -and ($TestGuest -or $InjectNmi)) {
+    Write-Error "-Kernel boots the kernel as the guest of the firmware build of Aleph0; do not combine it with -TestGuest or -InjectNmi."
+    exit 1
+}
 if ($SetVirtualAddressMap -and -not $Harness) {
     Write-Error "-SetVirtualAddressMap is a harness option; pass -Harness."
     exit 1
@@ -208,6 +219,19 @@ if ($Harness) {
         exit $buildExit
     }
 }
+if ($withLoader) {
+    $loaderArgs = @("build", "-p", "os-loader")
+    if ($Release) { $loaderArgs += "--release" }
+    Write-Host "==> cargo $($loaderArgs -join ' ')" -ForegroundColor Cyan
+    Push-Location $root
+    cargo @loaderArgs
+    $buildExit = $LASTEXITCODE
+    Pop-Location
+    if ($buildExit -ne 0) {
+        Write-Error "cargo build of the OS loader failed (exit code $buildExit)."
+        exit $buildExit
+    }
+}
 
 try {
     # 2. Stop the VM and detach the old disk so the VHDX can be rebuilt
@@ -242,10 +266,10 @@ try {
 
         $bootDir = "$($part.DriveLetter):\EFI\BOOT"
         New-Item -ItemType Directory -Force -ErrorAction Stop -Path $bootDir | Out-Null
-        $bootImage = if ($Harness) { $harnessSrc } elseif ($WithoutAleph0) { $Kernel } else { $efiSrc }
+        $bootImage = if ($Harness) { $harnessSrc } elseif ($withLoader) { $loaderSrc } elseif ($WithoutAleph0) { $Kernel } else { $efiSrc }
         Copy-Item -Force -ErrorAction Stop -LiteralPath $bootImage -Destination (Join-Path $bootDir "BOOTX64.EFI")
-        if ($Harness -and -not $WithoutAleph0) {
-            # Where the harness loads Aleph0 from.
+        if (($Harness -and -not $WithoutAleph0) -or $withLoader) {
+            # Where the harness and the loader load Aleph0 from.
             Copy-Item -Force -ErrorAction Stop -LiteralPath $efiSrc -Destination (Join-Path $bootDir "aleph0.efi")
         }
         if ($Kernel) {
