@@ -327,6 +327,39 @@ hardware injection through `VM_ENTRY_INTERRUPTION_INFO` works.
 Without `-InjectNmi`, the same guest prints `no NMI arrived` at exit #2,
 with `rcx = 0`: the loop ran out.
 
+### The re-delivery run (#26, on master after #54)
+
+Since #43 the guest's stack page is read-only in EPT, so the reinjected
+NMI's delivery faults as the CPU pushes the interrupt frame. Serial of
+`-InjectNmi` on 2026-10-31 (exits #1 to #23 are the emulated exits, the HLT,
+the data-page EPT write and main VMCALL #1):
+
+```text
+VM exit #24: NMI (interruption info=0x80000202); reinjecting it into the guest at rip=0x000000007ff46178.
+VM exit #25: reason=48 (EPT violation)
+VM exit #25: qualification=0x000000000000058a
+VM exit #25: EPT violation at GPA 0x000000007ff7fff8 (linear 0x000000007ff7fff8): write; ...
+VM exit #25: guest rip=0x000000007ff46178 instruction length=0
+VM exit #25: during event delivery: IDT-vectoring info=0x80000302 error code=0x0
+VM exit #25: write to the NMI stack page at GPA 0x000000007ff7fff8: write granted ...
+VM exit #25: re-delivering the interrupted event: entry interruption info=0x80000202, blocking by NMI cleared.
+VM exit #26: guest NMI handler ran (rax=0x4e4d49); the reinjected NMI was delivered; ...
+VM exit #27: expected VMCALL (rax=0xa1e1); all 2 planned VMCALLs handled; NMIs: 1 reinjected, 1 handled by the guest.
+Guest finished after 27 VM exits; VMX operation left.
+Returning to firmware with SUCCESS.
+```
+
+- **Exit #25** is the push of the NMI frame at the stack's top
+  (`0x7ff7fff8`, the page below `rsp=0x7ff80000`), at the same RIP as the
+  NMI exit, with instruction length 0: no instruction ran.
+- **`0x80000302`:** Hyper-V reports the interrupted NMI with type 3
+  (hardware exception), not 2; vector 2 is re-armed as a true NMI
+  (`0x80000202`), and blocking by NMI, which the faulted delivery left set, is
+  cleared so VM entry can inject it (section 8, `ExitInfo::redelivery`).
+- **Exit #26** proves the re-delivered NMI reached the guest's handler.
+
+Without `-InjectNmi` the guest ends as before: 24 exits, `SUCCESS`.
+
 ## 8. What is not covered yet
 
 - **NMIs while Aleph0 itself runs** are now handled: a VM exit loads
@@ -377,7 +410,11 @@ with `rcx = 0`: the loop ran out.
   EPT violation on the guest's IDT or stack) is re-delivered like any
   other event, above. This is the firmware guest's behaviour since #21:
   its timer and Hyper-V's synthetic interrupts reach it this way
-  ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md)).
+  ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md)). On Hyper-V with one vCPU
+  (`-ProcessorCount 1`, 2026-10-31), the firmware guest ran with IF = 1:
+  its timer fired, and in 12.4 million exits over 67 s there were only
+  CPUID, HLT, VMCALL and RDMSR exits (reasons 10, 12, 18, 31): no
+  external-interrupt exit and no stop on IDT-vectoring info.
 - **No double-fault synthesis.** An exit whose own plan advances RIP or
   injects an event while another is being re-delivered stops the guest.
 

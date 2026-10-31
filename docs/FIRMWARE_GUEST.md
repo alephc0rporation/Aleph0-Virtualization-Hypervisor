@@ -187,11 +187,13 @@ Aleph0 (HYPERV_INTERFACE.md section 7). Left alone at that screen, it ran
   quickly: about 36 million exits in three minutes at the Boot Summary
   screen, nearly all HLT, with the print policy keeping the first 16 of
   each reason in full and then one summary line per power of two.
-- CR0/CR4 masks, so the firmware sees CR4.VMXE today (#24). Interrupted
+- CR0/CR4 masks and read shadows (#24): the firmware reads CR4.VMXE as 0,
+  while GUEST_CR4 keeps it set ([CONTROL_REGISTERS.md](CONTROL_REGISTERS.md);
+  the `-ProcessorCount 1` run printed CR4 `shadow=0x668`). Interrupted
   events are re-delivered, an NMI behind an STI shadow waits for the
   interrupt window, and the firmware's interrupts pass straight through to
-  its IDT, for an OS too ([NMI.md](NMI.md) sections 5 and 8; #26 still
-  waits for its Hyper-V runs).
+  its IDT, for an OS too ([NMI.md](NMI.md) sections 5, 7 and 8; #26's
+  Hyper-V runs are recorded there).
 - The firmware guest still gets the test guest's pages, because `Ept::build`
   protects their data page. Nothing in the firmware touches it, and since
   #23 they are resident, so no OS reuses them either.
