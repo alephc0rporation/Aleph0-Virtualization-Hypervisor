@@ -29,14 +29,15 @@ use super::stats::{self, VcpuStats};
 use super::{RegisterFrame, read_field};
 use crate::output::Phase;
 use crate::port;
-use crate::vmx::cr::CrFixed;
+use crate::vmx::cr::{self, CrFixed};
 use crate::vmx::ept::{self, InveptType, ProtectedPage};
 use crate::vmx::exit_decision::{
-    CrNumber, CrQualification, EXIT_REASON_CONTROL_REGISTER, EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION,
-    EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_VMCALL, Emulation, ExitAction, ExitEvent, ExitInfo, ExitReason, ExitState,
-    InterruptionInfo, IoSize, Redelivery, ResumePlan, UNREADABLE_REASON, cpl_from_ss, cpuid_policy, decide,
-    is_canonical_48, merge_in,
+    CrNumber, CrQualification, EXIT_REASON_CONTROL_REGISTER, EXIT_REASON_CPUID, EXIT_REASON_EPT_MISCONFIG,
+    EXIT_REASON_EPT_VIOLATION, EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_VMCALL, Emulation, ExitAction, ExitEvent,
+    ExitInfo, ExitReason, ExitState, InterruptionInfo, IoSize, Redelivery, ResumePlan, UNREADABLE_REASON, cpl_from_ss,
+    cpuid_policy, decide, is_canonical_48, merge_in,
 };
+use crate::vmx::features;
 use crate::vmx::host;
 use crate::vmx::hyperv::{self, HypercallRegisters};
 use crate::vmx::instruction::VmxFail;
@@ -364,6 +365,14 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
     } else {
         Some(0)
     };
+    // Only CPUID copies the guest's CR4 (OSXSAVE, PKE); an unreadable one
+    // leaves the CPUID unjudged, and 0 stands in for any other exit.
+    let cpuid_exit = decoded.is_some_and(|reason| !reason.entry_failure && reason.basic == EXIT_REASON_CPUID);
+    let guest_cr4 = if cpuid_exit {
+        read_field(GUEST_CR4).ok()
+    } else {
+        Some(0)
+    };
     let rip = read_field(GUEST_RIP);
     let length = read_field(VM_EXIT_INSTRUCTION_LEN);
     let interruptibility = read_field(GUEST_INTERRUPTIBILITY_STATE);
@@ -403,6 +412,7 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
         guest_physical_for_decide,
         guest_cpl,
         cr_source,
+        guest_cr4,
     ) {
         (
             Some(reason),
@@ -413,6 +423,7 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
             Some(guest_physical),
             Some(guest_cpl),
             Some(cr_source),
+            Some(guest_cr4),
         ) => {
             Some(ExitInfo {
                 reason,
@@ -433,6 +444,8 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
                 guest_cpl,
                 cr_source,
                 cr_fixed,
+                guest_cr4,
+                xcr0_supported: features::published().xcr0,
             })
         }
         // An unreadable field is reported later; without it the exit cannot
@@ -589,6 +602,8 @@ pub(super) enum EmulationOutcome {
         raw: CpuidResult,
         guest: CpuidResult,
     },
+    /// XSETBV wrote `value` to XCR0.
+    Xsetbv { value: u64 },
     /// RDMSR of `msr` returned `value`.
     Rdmsr { msr: u32, value: u64 },
     /// WRMSR wrote `value` to `msr`.
@@ -650,11 +665,15 @@ fn hypercall_names_aleph0(input: u64, frame: &RegisterFrame) -> bool {
 /// with `frame` unchanged.
 fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationOutcome, ResumeFailure> {
     Ok(match emulation {
-        Emulation::Cpuid { leaf, subleaf } => {
+        Emulation::Cpuid {
+            leaf,
+            subleaf,
+            guest_cr4,
+        } => {
             // In root operation CPUID returns the processor's values (under
             // Hyper-V: what Hyper-V shows Aleph0).
             let raw = __cpuid_count(leaf, subleaf);
-            let guest = cpuid_policy(leaf, raw);
+            let guest = cpuid_policy(leaf, subleaf, raw, guest_cr4, features::published());
             // CPUID writes 32-bit registers, which zero-extends them.
             frame.rax = guest.eax.into();
             frame.rbx = guest.ebx.into();
@@ -666,6 +685,16 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationO
                 raw,
                 guest,
             }
+        }
+        Emulation::Xsetbv { value } => {
+            // SAFETY: `decide` lets an XSETBV through only with supported XCR0
+            // bits published, which bring-up does only with CR4.OSXSAVE in
+            // HOST_CR4 (`GuestFeatures::host_cr4`), and only for a value XCR0
+            // takes, so it cannot fault. VM entry and exit do not switch XCR0
+            // and Aleph0 never touches vector state (`vmexit` entry stub), so
+            // the guest's XCR0 is simply the CPU's.
+            unsafe { cr::xsetbv(value) };
+            EmulationOutcome::Xsetbv { value }
         }
         Emulation::Rdmsr { msr } => {
             // SAFETY: `decide` emulates only INTERCEPTED_MSRS, which exist on

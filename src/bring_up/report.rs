@@ -10,7 +10,8 @@ use crate::vmx;
 use crate::vmx::apic::{ApicBase, LAPIC_VERSION};
 use crate::vmx::cr::CrControls;
 use crate::vmx::ept::{Ept, EptSupport, Hidden, TypeTables, WalkEnd};
-use crate::vmx::exit_bitmaps::{ExitBitmaps, INTERCEPTED_MSRS, INTERCEPTED_PORTS};
+use crate::vmx::exit_bitmaps::{ExitBitmaps, intercepted};
+use crate::vmx::features::{GuestFeatures, HiddenCpuid};
 use crate::vmx::guest::{GuestMappings, GuestMemory};
 use crate::vmx::guest_state::{GuestEntry, GuestState};
 use crate::vmx::host::{HostEnvironment, InterruptStack};
@@ -18,6 +19,7 @@ use crate::vmx::hyperv::{Detection, INTERFACE_LEAF, SYNTHETIC_MSRS, VENDOR_LEAF}
 use crate::vmx::msr::VmcsControlMsrs;
 use crate::vmx::mtrr::{MtrrCapabilities, MtrrError, MtrrRegisters, Mtrrs};
 use crate::vmx::page::Allocation;
+use crate::vmx::vmcs::GuestKind;
 
 /// Prints the segmentation state of the context tables, which the guest
 /// state copies and the host GDT keeps the selectors of.
@@ -70,6 +72,36 @@ pub(super) fn cr_controls(controls: &CrControls) {
         controls.cr4_mask,
         controls.cr4_shadow,
     );
+}
+
+/// Prints what the guest is offered beyond the minimal controls: the
+/// secondary controls requested, the CPUID bits hidden for what is not, the
+/// XCR0 bits its XSETBV may set, and HOST_CR4 (`host_cr4`), which has
+/// OSXSAVE whenever Aleph0 runs XSETBV.
+pub(super) fn guest_features(features: GuestFeatures, host_cr4: u64) {
+    let hidden = features.hidden();
+    log!(
+        "Guest features: secondary controls {:#010x}; XCR0 supported {:#x} (XSETBV {}); HOST_CR4 {host_cr4:#x}.",
+        features.secondary,
+        features.xcr0,
+        if features.xsetbv() {
+            "run in root operation"
+        } else {
+            "gets #GP"
+        },
+    );
+    if hidden == HiddenCpuid::NONE {
+        log!("CPUID bits hidden from the guest: none (besides VMX).");
+    } else {
+        log!(
+            "CPUID bits hidden from the guest: 1:ECX={:#x} (7,0):EBX={:#x} (7,0):ECX={:#x} (0xD,1):EAX={:#x} 0x80000001:EDX={:#x} (besides VMX).",
+            hidden.leaf_1_ecx,
+            hidden.leaf_7_ebx,
+            hidden.leaf_7_ecx,
+            hidden.leaf_d_1_eax,
+            hidden.extended_edx,
+        );
+    }
 }
 
 /// Prints the VMX capability MSRs: IA32_VMX_BASIC; for each of the four
@@ -268,14 +300,15 @@ pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
 /// Prints where the exit bitmaps are and what they intercept: the MSRs
 /// passed through, every MTRR address, of which the guest's copy holds
 /// those `mtrr` lists, and the ports.
-pub(super) fn exit_bitmaps(bitmaps: &ExitBitmaps, mtrr: MtrrCapabilities) {
+pub(super) fn exit_bitmaps(bitmaps: &ExitBitmaps, kind: GuestKind, mtrr: MtrrCapabilities) {
     log!(
         "Exit bitmaps allocated: MSR={:#018x} I/O A={:#018x} I/O B={:#018x}.",
         bitmaps.msr_address(),
         bitmaps.io_a_address(),
         bitmaps.io_b_address(),
     );
-    log!("Intercepted MSRs (read and write): {INTERCEPTED_MSRS:x?}; intercepted ports: {INTERCEPTED_PORTS:x?}.");
+    let (msrs, ports) = intercepted(kind);
+    log!("Intercepted MSRs (read and write) for the {kind:?} guest: {msrs:x?}; intercepted ports: {ports:x?}.");
     let addresses = vmx::mtrr::every_msr_address().count();
     match mtrr.msrs().count() {
         0 => log!("Intercepted MTRR addresses (read and write): all {addresses}, which get #GP: the CPU has no MTRRs."),

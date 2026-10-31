@@ -32,7 +32,15 @@ fn each_emulated_instruction_has_its_own_counter() {
     let size = IoSize::Byte;
     let def_type = MtrrCapabilities::new(8, 46).unwrap().msr(0x2FF).unwrap();
     for (stats, counter) in [
-        (emulated(Emulation::Cpuid { leaf: 1, subleaf: 0 }), "cpuid_exits"),
+        (
+            emulated(Emulation::Cpuid {
+                leaf: 1,
+                subleaf: 0,
+                guest_cr4: 0,
+            }),
+            "cpuid_exits",
+        ),
+        (emulated(Emulation::Xsetbv { value: 0x3 }), "xsetbv_exits"),
         (emulated(Emulation::Rdmsr { msr: 0xC000_0102 }), "msr_read_exits"),
         (
             emulated(Emulation::Wrmsr {
@@ -90,7 +98,7 @@ fn stats_print_as_one_line_of_named_counters() {
     };
     assert_eq!(
         stats.to_string(),
-        "exits=13 cpuid_exits=1 msr_read_exits=2 msr_write_exits=2 mtrr_read_exits=0 mtrr_write_exits=0 \
+        "exits=13 cpuid_exits=1 xsetbv_exits=0 msr_read_exits=2 msr_write_exits=2 mtrr_read_exits=0 mtrr_write_exits=0 \
          io_in_exits=2 io_out_exits=2 halt_exits=1 nmi_injections=0 exception_injections=0 \
          hypercall_exits=0 synthetic_read_exits=0 synthetic_write_exits=0"
     );
@@ -142,6 +150,7 @@ fn nothing_else_is_forwarded() {
         Some(Emulation::Cpuid {
             leaf: 0x4000_0000,
             subleaf: 0,
+            guest_cr4: 0,
         }),
         Some(Emulation::Rdmsr { msr: 0xC000_0102 }),
     ] {

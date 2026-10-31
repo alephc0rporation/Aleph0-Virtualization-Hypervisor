@@ -68,7 +68,7 @@ in the `_` arm, which is `Unexpected` and stops the guest.
 
 The handlers live in two files:
 - `emulation.rs`: instructions Aleph0 executes for **any** guest (CPUID,
-  RDMSR, WRMSR, IN, OUT). It stays when an OS guest comes.
+  XSETBV, RDMSR, WRMSR, IN, OUT). It stays when an OS guest comes.
 - `scenario.rs`: the test guest's own exits (its write to the protected data
   page, its VMCALLs, NMI reinjection). It goes when an OS guest comes.
 
@@ -178,26 +178,41 @@ CPUID always exits in VMX non-root operation; no control turns that off.
 ECX, and `execute` runs `__cpuid_count(leaf, subleaf)` in root operation.
 Under Hyper-V that returns what Hyper-V shows Aleph0.
 
-Everything passes through except one bit:
-
-```rust
-const CPUID_1_ECX_VMX: u32 = 1 << 5;
-
-pub fn cpuid_policy(leaf: u32, raw: CpuidResult) -> CpuidResult {
-    match leaf {
-        1 => CpuidResult {
-            ecx: raw.ecx & !CPUID_1_ECX_VMX,
-            ..raw
-        },
-        _ => raw,
-    }
-}
-```
+`cpuid_policy(leaf, subleaf, raw, guest_cr4, features)` changes three kinds
+of bits and passes the rest through. `guest_cr4` is GUEST_CR4, which the
+handler reads on CPUID exits only; `features` is what bring-up offers the
+guest (`vmx::features::GuestFeatures`, published before VMLAUNCH).
 
 **CPUID.1:ECX bit 5 (VMX) is hidden.** A guest that saw it would try VMXON,
 which always exits (reason 27) in non-root operation, and Aleph0 does not
 emulate VMX. The report line prints both values, so the effect is visible:
 `ecx=` is what the guest got, `processor ecx=` what the CPU returned.
+
+**The bits that copy CR4 follow the guest's CR4.** CPUID.1:ECX bit 27
+(OSXSAVE) copies CR4.OSXSAVE, and CPUID.(7,0):ECX bit 4 (OSPKE) copies
+CR4.PKE. CPUID runs in root operation, where they copy HOST_CR4, and HOST_CR4
+has OSXSAVE so that Aleph0 can run XSETBV (section 3a). The guest gets them
+from its own CR4 instead, both ways.
+
+**What the guest is not offered is hidden.** Each secondary control below is
+requested when the CPU allows it (`features::secondary_request`). While one is
+0, its instructions raise #UD in the guest (Intel SDM Vol. 3C, "Changes to
+Instruction Behavior in VMX Non-Root Operation"), so its CPUID bits are
+cleared then (`GuestFeatures::hidden`):
+
+| Secondary control | Bit | #UD while 0 | CPUID bits cleared |
+|---|---|---|---|
+| enable RDTSCP | 3 | RDTSCP, RDPID | 0x80000001:EDX bit 27; (7,0):ECX bit 22 |
+| enable INVPCID | 12 | INVPCID | (7,0):EBX bit 10 |
+| enable XSAVES/XRSTORS | 20 | XSAVES, XRSTORS | (0xD,1):EAX bit 3 |
+| enable user wait and pause | 26 | TPAUSE, UMONITOR, UMWAIT | (7,0):ECX bit 5 |
+
+CPUID.1:ECX bit 26 (XSAVE) is cleared too when Aleph0 cannot run XSETBV.
+Hyper-V allows all four controls (`allowed=0x065018ae`), so the request is
+`0x0410100a` (EPT and the four) and nothing is cleared. With XSAVES enabled,
+the XSS-exiting bitmap (`0x202C`) is written as 0, so XSAVES and XRSTORS never
+exit. INVPCID and RDTSCP exit only with INVLPG exiting or RDTSC exiting, which
+Aleph0 does not request and Hyper-V does not require.
 
 What passes through:
 - **ECX bit 31 (hypervisor present) and the leaves from 0x40000000.** Under
@@ -206,10 +221,33 @@ What passes through:
   and the synthetic MSRs. Decided in #27: the guest keeps them, and Aleph0
   forwards the hypercalls and the synthetic MSRs to Hyper-V
   ([HYPERV_INTERFACE.md](HYPERV_INTERFACE.md)).
-- **Values that follow CR4 and XCR0**, still to be decided before an OS
-  guest: CPUID.1:ECX.OSXSAVE and leaf 0xD
-  (the XSAVE area size). They are right for the guest only while its CR4 and
-  XCR0 equal the host's, as they do today.
+- **Leaf 0xD's sizes**, which follow XCR0. VM entry and exit do not switch
+  XCR0, and only the guest's XSETBV changes it, so they are the guest's.
+
+### 3a. XSETBV
+
+XSETBV always exits (reason 55). `emulation::xsetbv` takes the XCR from ECX
+and the value from EDX:EAX, and emulates it only for XCR0 and a value XCR0
+takes (`xcr0_valid`); anything else gets #GP(0), as the SDM's XSETBV lists:
+
+- a bit outside the XCR0 bits the CPU supports (CPUID.(0xD,0):EDX:EAX, read
+  once at bring-up);
+- bit 0 (x87) clear, or bit 2 (AVX) set with bit 1 (SSE) clear;
+- bits 7:5 (AVX-512) neither all clear nor all set, or set without bits 2:1;
+- bits 4:3 (MPX) or bits 18:17 (AMX) not equal.
+
+The CPU raises the #UD of a guest with CR4.OSXSAVE clear and the #GP of
+CPL > 0 before any VM exit, so the decision checks only the value. `execute`
+then runs the real XSETBV in root operation and RIP moves past it. Sharing
+XCR0 with the guest is sound because Aleph0 never touches vector state (the
+soft-float target, `vmexit` entry stub).
+
+XSETBV in root operation needs CR4.OSXSAVE there, or it raises #UD through
+the host IDT. So when CPUID.1:ECX.XSAVE is set and IA32_VMX_CR4_FIXED1 allows
+bit 18, bring-up puts OSXSAVE in HOST_CR4 (`GuestFeatures::host_cr4`); the
+guest's CR4 is captured on its own and keeps the firmware's OSXSAVE, and
+teardown loads the firmware's CR4 again. Otherwise the supported mask is 0, so
+every XSETBV gets #GP, and CPUID hides XSAVE.
 
 ## 4. The MSR bitmap
 
@@ -219,11 +257,15 @@ RDMSR and WRMSR cause a VM exit depending on one primary control:
   always for MSRs outside the two ranges the bitmap covers.
 
 Aleph0 turns the control on (`DesiredControls::minimal_64_bit_guest`).
-`ExitBitmaps::allocate` makes three zeroed pages (this one and the two I/O
-bitmaps of section 5) and sets the bits of `INTERCEPTED_MSRS`, of every
-address an MTRR MSR can have, and of `INTERCEPTED_PORTS`; `write_to_vmcs` writes the
-MSR bitmap's address to
-`MSR_BITMAP` (`0x2004`). The page has four quarters:
+`ExitBitmaps::allocate(kind)` makes three zeroed pages (this one and the two
+I/O bitmaps of section 5) and sets the bits of every address an MTRR MSR can
+have, for every guest, and of `INTERCEPTED_MSRS` and `INTERCEPTED_PORTS` for
+the test guest only (`exit_bitmaps::intercepted`). For the firmware or an OS,
+an exit for IA32_KERNEL_GS_BASE or port `0x3FF` would only repeat the access,
+so their bits stay clear and the I/O bitmaps all zero: no IN, OUT, INS or OUTS
+exits, and of the MSRs in the two ranges only the MTRRs do. `write_to_vmcs`
+writes the MSR bitmap's address to `MSR_BITMAP` (`0x2004`). The page has four
+quarters:
 
 ```text
 MSR bitmap, one 4 KiB page (Intel SDM Vol. 3C, "MSR-Bitmap Address"):
@@ -574,7 +616,8 @@ exits follow, numbered here as under Hyper-V, where the last range is 7:
 ```rust
 pub fn expected_stats(actual: &VcpuStats) -> VcpuStats {
     VcpuStats {
-        cpuid_exits: 2,
+        cpuid_exits: 3,
+        xsetbv_exits: 2,
         msr_read_exits: 2,
         msr_write_exits: 2,
         mtrr_read_exits: 3,
@@ -606,9 +649,10 @@ VM exit #N: RDMSR 0xc0000102 -> 0x...; resuming at rip=...
 VM exit #N: WRMSR 0xc0000102 <- 0x00007a1e00000000; resuming at rip=...
 VM exit #N: IN port 0x3ff size=1 -> 0x...; resuming at rip=...
 VM exit #N: OUT port 0x3ff size=1 value=0xa5; resuming at rip=...
+VM exit #N: XSETBV XCR0 <- 0x3; resuming at rip=...
 VM exit #N: RDMSR 0x20f (IA32_MTRR_PHYSMASK7) -> 0x00003fffffe00800, from the guest's MTRRs; resuming at rip=...
 VM exit #N: WRMSR 0x20f (IA32_MTRR_PHYSMASK7) <- 0x0000000000000000, into the guest's MTRRs; the CPU's IA32_MTRR_PHYSMASK7 stays 0x0000000000000000.
-VM exit #N: exit statistics: exits=... cpuid_exits=2 msr_read_exits=2 msr_write_exits=2 mtrr_read_exits=3 mtrr_write_exits=7 ...
+VM exit #N: exit statistics: exits=... cpuid_exits=3 xsetbv_exits=2 msr_read_exits=2 msr_write_exits=2 mtrr_read_exits=3 mtrr_write_exits=7 ...
 ```
 
 An MTRR write that changes types adds the guest's MTRRs and the EPT
@@ -753,20 +797,76 @@ The NMI is not an emulated exit, so the counts stay at 1, 2, 2, 2, 2.
 > prints `exit statistics: ...` in place of `emulated exits: ...`, and
 > bring-up, not the last VMCALL, checks the counts.
 
+### XSETBV, the secondary controls and the CPUID bits (#25)
+
+On Hyper-V, 2026-10-31. The test guest now sets CR4.OSXSAVE after its I/O
+checks, checks CPUID.1:ECX.OSXSAVE, saves XCR0 with XGETBV, writes `0x3` with
+XSETBV, reads it back, puts the saved value back, clears CR4.OSXSAVE and runs
+RDTSCP. `-TestGuest`, bring-up:
+
+```text
+Intercepted MSRs (read and write) for the BuiltInTest guest: [c0000102]; intercepted ports: [3ff].
+Guest features: secondary controls 0x0410100a; XCR0 supported 0x7 (XSETBV run in root operation); HOST_CR4 0x42668.
+CPUID bits hidden from the guest: none (besides VMX).
+```
+
+The guest's new exits:
+
+```text
+VM exit #1: CPUID leaf=0x1 subleaf=0x0 -> eax=0x00090672 ebx=0x00020800 ecx=0xf7fa3203 edx=0x1f8bfbff (processor ecx=0xfffa3223); resuming at rip=0x000000007ff46009.
+VM exit #10: CPUID leaf=0x1 subleaf=0x0 -> eax=0x00090672 ebx=0x00020800 ecx=0xfffa3203 edx=0x1f8bfbff (processor ecx=0xfffa3223); resuming at rip=0x000000007ff46079.
+VM exit #11: reason=55 (XSETBV)
+VM exit #11: XSETBV XCR0 <- 0x3; resuming at rip=0x000000007ff46096.
+VM exit #12: reason=55 (XSETBV)
+VM exit #12: XSETBV XCR0 <- 0x1; resuming at rip=0x000000007ff460b1.
+```
+
+- The request is `0x0410100a`: EPT and all four optional controls, so no
+  CPUID bit is hidden. Hyper-V supports XCR0 bits `0x7` (x87, SSE, AVX), and
+  HOST_CR4 is the firmware's `0x2668` with OSXSAVE (`0x40000`) added.
+- With OSXSAVE in HOST_CR4, the processor's CPUID.1:ECX is `0xfffa3223`,
+  OSXSAVE (bit 27) set; before #25 it was `0xf7fa3223`. At exit #1 the guest's
+  CR4 had OSXSAVE clear (the history shows `guest_cr4: 2668`) and it got
+  `0xf7fa3203`; at exit #10, after its MOV to CR4 (`guest_cr4: 42668`),
+  `0xfffa3203`. Without the CR4 copy the firmware would have read OSXSAVE = 1
+  with its own CR4.OSXSAVE clear.
+- The MOV to CR4 did not exit: the CR4 mask, `0xffffffffff48f000`, leaves
+  bit 18 to the guest. The XGETBVs do not exit, and RDTSCP ran without #UD.
+- XCR0 was `0x1` before the guest and is put back by exit #12.
+
+The run ended `exits=27 cpuid_exits=3 xsetbv_exits=2 ... exception_injections=0`,
+`55 (XSETBV)=2` among the exits by reason, `restored=true` and `SUCCESS`.
+`-InjectNmi`: the same exits #11 and #12, the NMI reinjected at #27, `NMIs: 1
+reinjected, 1 handled by the guest` at #30, `exits=30 ... xsetbv_exits=2 ...
+nmi_injections=1`, `restored=true` and `SUCCESS`.
+
+The firmware, `-ProcessorCount 1`: `Intercepted MSRs (read and write) for the
+Firmware guest: []; intercepted ports: [].`, the same guest-features lines,
+then 6.1 million exits in about 32 s with no stop, of reasons 10, 12, 18 and
+31 only: no I/O exit, and every RDMSR exit was the synthetic `0x40000020`,
+outside the bitmap's ranges and forwarded to Hyper-V. The firmware ran no
+XSETBV in that time.
+
 ## 8. Limits before an OS guest
 
-- **The CPUID decisions of section 3**: OSXSAVE with leaf 0xD. The
-  hypervisor-present bit and the leaves from 0x40000000 pass through, with
-  Hyper-V's interface forwarded (#27).
-- **Unconditional exits.** XSETBV (reason 55), INVD (13), GETSEC (11), the
-  VMX instructions and task switches always exit. Aleph0 handles none of
-  them (except the test guest's VMCALLs, in `scenario.rs`); they reach the
-  `_` arm and stop the guest. An OS runs XSETBV early.
-- **String and REP I/O** stop the guest (section 5).
-- **Only one MSR, the MTRRs and one port are intercepted.** Every other
-  MSR inside the bitmap's ranges and every other port reaches the hardware
-  without Aleph0 seeing it (MSRs outside the ranges get a #GP, section 4). The
-  multi-port rule (section 5) also lets a wide access that touches `0x3FF`
+- **The hypervisor-present bit and the leaves from 0x40000000** pass
+  through, with Hyper-V's interface forwarded (#27). OSXSAVE, OSPKE and the
+  features of the optional secondary controls are decided (section 3).
+- **Unconditional exits.** INVD (13), GETSEC (11), the VMX instructions and
+  task switches always exit. Aleph0 handles none of them (except the test
+  guest's VMCALLs, in `scenario.rs`); they reach the `_` arm and stop the
+  guest. XSETBV (55), which an OS runs early, is emulated (section 3a).
+- **String and REP I/O** stop the guest (section 5). They exit only for an
+  intercepted port, and the firmware's I/O bitmaps intercept none, so they
+  matter for the test guest alone.
+- **Only the test guest's MSR and port are intercepted, beside the MTRRs.**
+  IA32_KERNEL_GS_BASE and port `0x3FF` exit only in the test guest
+  (`exit_bitmaps::intercepted`); for the firmware or an OS each exit would
+  only repeat the access. Every other MSR inside the bitmap's ranges and every
+  other port reaches the hardware without Aleph0 seeing it (MSRs outside the
+  ranges get a #GP, section 4). The MTRR addresses keep exiting for every
+  guest: the guest writes a copy of them (docs/MTRR.md). The multi-port rule
+  (section 5) also lets the test guest's wide access that touches `0x3FF`
   reach its neighbours, COM1's other registers, which are the guest's.
 - **The #GP and #UD paths are tested on the host only.** They are
   delivered through the guest's own IDT, which in the test guest has only
@@ -857,4 +957,4 @@ guest`, which arms the `-InjectNmi` job after main VMCALL #1.
 | Exception bitmap | all ones for the test guest, 0 for the firmware |
 | `GUEST_MSR_VALUE` / `GUEST_IO_VALUE` | `0x0000_7A1E_0000_0000` / `0xA5` |
 | `GUEST_EMULATION_FAIL_MARKER` | `0xFA11` in EAX at the `ud2` |
-| `guest::expected_stats` | cpuid 2, MSR reads 2, MSR writes 2, MTRR reads 3, MTRR writes 7, in 2, out 2, halt 1, exceptions 0 |
+| `guest::expected_stats` | cpuid 3, xsetbv 2, MSR reads 2, MSR writes 2, MTRR reads 3, MTRR writes 7, in 2, out 2, halt 1, exceptions 0 |

@@ -37,6 +37,14 @@ pub const CR4_LA57: u64 = 1 << 12;
 /// CR4 bit 13: VMX-enable. VMXON raises #UD while this is clear.
 pub const CR4_VMXE: u64 = 1 << 13;
 
+/// CR4 bit 18 (OSXSAVE): XGETBV and XSETBV may run, and CPUID.1:ECX bit 27
+/// reports this bit.
+pub const CR4_OSXSAVE: u64 = 1 << 18;
+
+/// CR4 bit 22 (PKE): protection keys for user pages, which
+/// CPUID.(EAX=7,ECX=0):ECX bit 4 (OSPKE) reports.
+pub const CR4_PKE: u64 = 1 << 22;
+
 /// CR4 bit 20 (SMEP): ring 0 may not execute from user pages.
 pub const CR4_SMEP: u64 = 1 << 20;
 
@@ -87,6 +95,26 @@ control_register!(read_cr4, write_cr4, "cr4");
 pub unsafe fn enable_vmxe() {
     // SAFETY: only VMXE changes, which the caller has checked is supported.
     unsafe { write_cr4(read_cr4() | CR4_VMXE) };
+}
+
+/// Writes `value` to XCR0 with XSETBV (ECX = 0).
+///
+/// # Safety
+///
+/// CR4.OSXSAVE must be set, and `value` one XSETBV takes (the XSETBV
+/// decision in `exit_decision`), or it faults. The new XCR0 decides which
+/// state XSAVE saves, so it must be one the code running afterwards expects.
+pub unsafe fn xsetbv(value: u64) {
+    // SAFETY: the caller guarantees CR4.OSXSAVE and a value XCR0 takes.
+    unsafe {
+        asm!(
+            "xsetbv",
+            in("ecx") 0,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nomem, nostack, preserves_flags),
+        )
+    };
 }
 
 /// The IA32_VMX_CR0/CR4_FIXED0/FIXED1 MSRs: the CR0 and CR4 bits VMX

@@ -20,6 +20,7 @@ pub mod cr;
 pub mod ept;
 pub mod exit_bitmaps;
 pub mod exit_decision;
+pub mod features;
 pub mod guest;
 pub mod guest_state;
 pub mod host;

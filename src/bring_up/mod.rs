@@ -70,6 +70,7 @@ use crate::vmx::context_tables::{GdtError, GdtRegion, TssRegion};
 use crate::vmx::cr::{CrControls, CrFixed};
 use crate::vmx::ept::{self, Ept, EptSupport, TypeTables};
 use crate::vmx::exit_bitmaps::ExitBitmaps;
+use crate::vmx::features::GuestFeatures;
 use crate::vmx::guest::{GUEST_SCRATCH_PORT, GuestMemory};
 use crate::vmx::guest_state::{GuestEntry, GuestState};
 use crate::vmx::host::{FirmwareSelectors, HostEnvironment};
@@ -343,8 +344,8 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
         );
     }
 
-    let bitmaps = ExitBitmaps::allocate()?;
-    report::exit_bitmaps(&bitmaps, capabilities);
+    let bitmaps = ExitBitmaps::allocate(GuestKind::SELECTED)?;
+    report::exit_bitmaps(&bitmaps, GuestKind::SELECTED, capabilities);
     // `mtrrs` and `types` are published to the exit handler only in
     // `launch_guest`, once every page Aleph0 keeps is allocated and `hide`
     // has redirected them to the shadow: no exit, which is the only reader,
@@ -515,8 +516,10 @@ fn launch_guest(
             idtr: context_tables.idtr,
         },
     };
-    prepare_vmcs(controls, vmexit_stack, ept, host, bitmaps, kind, entry)?;
+    let features = prepare_vmcs(controls, vmexit_stack, ept, host, bitmaps, kind, entry)?;
     check_context_tables_preserved(context_tables)?;
+    // Before VMLAUNCH: the exit handler's CPUID and XSETBV read it.
+    vmx::features::publish(features);
 
     match kind {
         GuestKind::BuiltInTest => run_test_guest(vmexit_stack),
@@ -694,9 +697,10 @@ fn check_mtrrs_untouched(
     }
 }
 
-/// Fills in the current VMCS: controls for a `kind` guest, EPT pointer, exit
-/// bitmaps, host state, and guest state starting at `entry`. VM entry is not
-/// attempted.
+/// Fills in the current VMCS: controls for a `kind` guest, with what it is
+/// offered beyond them ([`GuestFeatures`]), EPT pointer, exit bitmaps, host
+/// state, and guest state starting at `entry`. VM entry is not attempted.
+/// Returns the features, for the exit handler.
 fn prepare_vmcs(
     controls: &VmcsControlMsrs,
     vmexit_stack: &VmExitStack,
@@ -705,16 +709,26 @@ fn prepare_vmcs(
     bitmaps: &ExitBitmaps,
     kind: GuestKind,
     entry: GuestEntry,
-) -> Result<(), BringUpError> {
+) -> Result<GuestFeatures, BringUpError> {
     // SAFETY: VMX root operation with the VMCS `run` created and made
     // current.
     unsafe { vmx::vmcs::self_test() }.map_err(vmcs_step("self-test"))?;
     log!("VMCS self-test passed: VMREAD returned what VMWRITE stored.");
 
+    // SAFETY: VMX root operation, so the CPU supports VMX.
+    let features = unsafe { GuestFeatures::read(controls.secondary) };
+    let host_cr4 = features.host_cr4(vmx::cr::read_cr4());
+    report::guest_features(features, host_cr4);
+
     // SAFETY: VMX root operation with the VMCS `run` created and made
     // current.
-    unsafe { vmx::vmcs::configure_controls(controls, DesiredControls::minimal_64_bit_guest(kind)) }
-        .map_err(vmcs_step("control setup"))?;
+    unsafe {
+        vmx::vmcs::configure_controls(
+            controls,
+            DesiredControls::minimal_64_bit_guest(kind, features.secondary),
+        )
+    }
+    .map_err(vmcs_step("control setup"))?;
     log!("VMCS controls for the {kind:?} guest written and read back successfully.");
 
     // SAFETY: VMX root operation with the VMCS `run` created and made
@@ -731,8 +745,10 @@ fn prepare_vmcs(
     log!("VMCS MSR and I/O bitmap addresses written and read back.");
 
     // SAFETY: VMX root operation with the VMCS `run` created and made
-    // current. The host environment's pages are never freed.
-    unsafe { vmx::vmcs::configure_host_state(&host.vmcs_tables()) }.map_err(vmcs_step("host-state setup"))?;
+    // current. The host environment's pages are never freed. `host_cr4` is
+    // the running CR4 with at most OSXSAVE added, which the exit handler
+    // runs XSETBV with.
+    unsafe { vmx::vmcs::configure_host_state(&host.vmcs_tables(), host_cr4) }.map_err(vmcs_step("host-state setup"))?;
     // SAFETY: VMX root operation with the VMCS `run` created and made
     // current.
     let exit_controls = unsafe { vmx::vmcs::vmread(vmx::vmcs::fields::VM_EXIT_CONTROLS) }
@@ -759,7 +775,7 @@ fn prepare_vmcs(
     unsafe { guest_state.write() }.map_err(guest_state_error)?;
     report::guest_state(&guest_state, entry);
 
-    Ok(())
+    Ok(features)
 }
 
 /// Turns the way the guest stopped into bring-up's result.

@@ -26,6 +26,8 @@ pub struct VcpuStats {
     pub exits: u64,
     /// CPUIDs executed for the guest.
     pub cpuid_exits: u64,
+    /// XSETBVs executed for the guest.
+    pub xsetbv_exits: u64,
     /// RDMSRs executed for the guest.
     pub msr_read_exits: u64,
     /// WRMSRs executed for the guest.
@@ -58,6 +60,7 @@ impl VcpuStats {
     pub const ZERO: Self = Self {
         exits: 0,
         cpuid_exits: 0,
+        xsetbv_exits: 0,
         msr_read_exits: 0,
         msr_write_exits: 0,
         mtrr_read_exits: 0,
@@ -84,6 +87,7 @@ impl VcpuStats {
     pub fn count_resumed(&mut self, event: ExitEvent, plan: ResumePlan) {
         match plan.emulate {
             Some(Emulation::Cpuid { .. }) => self.cpuid_exits += 1,
+            Some(Emulation::Xsetbv { .. }) => self.xsetbv_exits += 1,
             Some(Emulation::Rdmsr { .. }) => self.msr_read_exits += 1,
             Some(Emulation::Wrmsr { .. }) => self.msr_write_exits += 1,
             Some(Emulation::MtrrRead { .. }) => self.mtrr_read_exits += 1,
@@ -114,6 +118,7 @@ impl fmt::Display for VcpuStats {
         let Self {
             exits,
             cpuid_exits,
+            xsetbv_exits,
             msr_read_exits,
             msr_write_exits,
             mtrr_read_exits,
@@ -129,7 +134,7 @@ impl fmt::Display for VcpuStats {
         } = self;
         write!(
             f,
-            "exits={exits} cpuid_exits={cpuid_exits} msr_read_exits={msr_read_exits} \
+            "exits={exits} cpuid_exits={cpuid_exits} xsetbv_exits={xsetbv_exits} msr_read_exits={msr_read_exits} \
              msr_write_exits={msr_write_exits} mtrr_read_exits={mtrr_read_exits} \
              mtrr_write_exits={mtrr_write_exits} io_in_exits={io_in_exits} io_out_exits={io_out_exits} \
              halt_exits={halt_exits} nmi_injections={nmi_injections} exception_injections={exception_injections} \
