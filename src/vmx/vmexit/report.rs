@@ -14,8 +14,8 @@ use super::{RegisterFrame, dump, history, read_field, stats};
 use crate::vmx::ept::{Eptp, InveptType, Retyped};
 use crate::vmx::exit_decision::{
     CrQualification, CrWrite, EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EXCEPTION_OR_NMI, EXIT_REASON_RDMSR,
-    EXIT_REASON_VMCALL, EXIT_REASON_WRMSR, EptQualification, ExitEvent, ExitInfo, ExitState, InterruptionInfo,
-    PLANNED_MAIN_VMCALLS, ResumePlan, exit_reason_name, expected_main_rax, wrmsr_value,
+    EXIT_REASON_VMCALL, EXIT_REASON_WRMSR, EXIT_REASON_XSETBV, EptQualification, ExitEvent, ExitInfo, ExitState,
+    InterruptionInfo, PLANNED_MAIN_VMCALLS, ResumePlan, exit_reason_name, expected_main_rax, wrmsr_value,
 };
 use crate::vmx::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE};
 use crate::vmx::hyperv;
@@ -495,6 +495,9 @@ fn report_emulation(number: u64, outcome: Option<EmulationOutcome>, rip: u64) {
             guest.edx,
             raw.ecx,
         ),
+        Some(EmulationOutcome::Xsetbv { value }) => {
+            crate::serial_println!("{tag} VM exit #{number}: XSETBV XCR0 <- {value:#x}; resuming at rip={rip:#018x}.")
+        }
         Some(EmulationOutcome::Rdmsr { msr, value }) => crate::serial_println!(
             "{tag} VM exit #{number}: RDMSR {msr:#x} -> {value:#018x}; resuming at rip={rip:#018x}."
         ),
@@ -583,12 +586,22 @@ fn report_cr_write(number: u64, write: CrWrite, rip: u64) {
     );
 }
 
-/// Prints why the guest gets a #GP at its RDMSR or WRMSR: for a WRMSR of
+/// Prints why the guest gets a #GP at its XSETBV, RDMSR or WRMSR: for an
+/// XSETBV, the XCR and value with the XCR0 bits supported; for a WRMSR of
 /// one of its MTRRs, what the CPU refuses in the value; for an MTRR address
 /// the CPU has no MSR at, that; otherwise, that the MSR is outside the MSR
 /// bitmap or the value is not canonical.
 fn report_general_protection(number: u64, exit: Option<ExitInfo>, rip: u64) {
     let tag = crate::TAG;
+    if let Some(exit) = exit.filter(|exit| exit.reason.basic == EXIT_REASON_XSETBV) {
+        crate::serial_println!(
+            "{tag} VM exit #{number}: XSETBV XCR{} <- {:#x}: not XCR0, or a value XCR0 does not take (supported {:#x}); injecting #GP(0) at rip={rip:#018x}.",
+            exit.guest_rcx as u32,
+            wrmsr_value(&exit),
+            exit.xcr0_supported,
+        );
+        return;
+    }
     let msr = exit.map_or(0, |exit| exit.guest_rcx as u32);
     let refused_mtrr = exit
         .filter(|exit| exit.reason.basic == EXIT_REASON_WRMSR)

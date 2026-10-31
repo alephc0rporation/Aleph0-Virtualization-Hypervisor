@@ -13,7 +13,7 @@
 //! in one place:
 //!
 //! - `emulation.rs`: instructions Aleph0 executes for any guest (CPUID,
-//!   RDMSR, WRMSR, IN, OUT), RDMSR and WRMSR of the guest's MTRRs, which
+//!   XSETBV, RDMSR, WRMSR, IN, OUT), RDMSR and WRMSR of the guest's MTRRs, which
 //!   reach a copy of them instead, and of Hyper-V's synthetic MSRs, which
 //!   are forwarded to Hyper-V, and HLT, which it skips. Each handler reads
 //!   the exit alone: `fn(&ExitInfo) -> ExitEvent`. MWAIT and MONITOR, which
@@ -95,6 +95,7 @@ pub fn exit_reason_name(basic: u16) -> &'static str {
         41 => "VM-entry failure: machine-check event",
         48 => "EPT violation",
         49 => "EPT misconfiguration",
+        55 => "XSETBV",
         UNREADABLE_REASON => "VM_EXIT_REASON unreadable",
         _ => "unnamed exit reason",
     }
@@ -141,6 +142,8 @@ pub const EXIT_REASON_EPT_VIOLATION: u16 = 48;
 /// cannot use at all (for example W = 1 with R = 0). It stops the guest
 /// ([`ExitEvent::EptMisconfig`]).
 pub const EXIT_REASON_EPT_MISCONFIG: u16 = 49;
+/// Basic exit reason of XSETBV, which always exits.
+pub const EXIT_REASON_XSETBV: u16 = 55;
 
 // Exit qualification bits of an EPT violation (Intel SDM Vol. 3C, "Exit
 // Qualification for EPT Violations").
@@ -409,6 +412,12 @@ pub struct ExitInfo {
     /// The CR0/CR4 FIXED MSRs, for the control-register decision. Read for
     /// control-register exits only; [`CrFixed::NONE`] otherwise.
     pub cr_fixed: CrFixed,
+    /// GUEST_CR4, which CPUID's OSXSAVE and OSPKE bits copy. Read for CPUID
+    /// exits only; 0 otherwise.
+    pub guest_cr4: u64,
+    /// The XCR0 bits the guest's XSETBV may set (`features::GuestFeatures`),
+    /// 0 when Aleph0 cannot run XSETBV.
+    pub xcr0_supported: u64,
 }
 
 /// The CPL from the guest's SS access rights (GUEST_SS_ACCESS_RIGHTS): its
@@ -542,10 +551,11 @@ pub enum ExitEvent {
     EptMisconfig,
     /// An instruction Aleph0 executes for the guest, then resumes past it.
     Emulated(Emulation),
-    /// RDMSR or WRMSR the guest gets a #GP for: an MSR outside the MSR
-    /// bitmap that is not forwarded to Hyper-V, an MTRR address the CPU has
-    /// no MSR at, a non-canonical value for an intercepted MSR, or a value
-    /// its MTRRs would refuse.
+    /// RDMSR, WRMSR or XSETBV the guest gets a #GP for: an MSR outside the
+    /// MSR bitmap that is not forwarded to Hyper-V, an MTRR address the CPU
+    /// has no MSR at, a non-canonical value for an intercepted MSR, a value
+    /// its MTRRs would refuse, or an XSETBV of another XCR than XCR0 or of a
+    /// value XCR0 does not take.
     GuestGeneralProtection,
     /// A MOV to CR0/CR4 Aleph0 emulates: write the read shadow and GUEST_CRn,
     /// then resume past it (`control_register`).
@@ -871,6 +881,7 @@ pub fn decide(guest: GuestKind, state: ExitState, exit: ExitInfo) -> (ExitEvent,
     let test_guest = guest == GuestKind::BuiltInTest;
     match exit.reason.basic {
         EXIT_REASON_CPUID => (emulation::cpuid(&exit), state),
+        EXIT_REASON_XSETBV => (emulation::xsetbv(&exit), state),
         EXIT_REASON_RDMSR => (emulation::rdmsr(&exit), state),
         EXIT_REASON_WRMSR => (emulation::wrmsr(&exit), state),
         EXIT_REASON_IO_INSTRUCTION => (emulation::io(&exit), state),

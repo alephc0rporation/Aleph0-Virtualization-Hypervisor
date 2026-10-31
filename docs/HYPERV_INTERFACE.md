@@ -380,7 +380,8 @@ directory of its own; it is not part of the repository.
 - **Synthetic interrupts:** with external-interrupt exiting off, Hyper-V's
   interrupts reach the guest's IDT directly (the firmware timer above), and
   stay that way for an OS ([NMI.md](NMI.md) section 8, #26).
-- **The CPUID bits that follow the guest's CR4 and secondary controls:** #25.
+- **The CPUID bits that follow the guest's CR4 and secondary controls:**
+  done in #25 ([EMULATED_EXITS.md](EMULATED_EXITS.md) section 3).
 
 ## Cheat sheet
 

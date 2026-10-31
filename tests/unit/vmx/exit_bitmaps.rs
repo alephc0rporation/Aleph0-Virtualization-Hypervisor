@@ -54,11 +54,20 @@ fn com1_scratch_is_bit_7_of_byte_0x7f() {
     assert_eq!(io_bit(0x3FF), (IoBitmap::A, 0x7F, 7));
 }
 
+/// The three bitmap pages [`fill`] makes for a `kind` guest.
+fn filled(kind: GuestKind) -> ([u8; PAGE_SIZE], [u8; PAGE_SIZE], [u8; PAGE_SIZE]) {
+    let (mut msr, mut io_a, mut io_b) = ([0u8; PAGE_SIZE], [0u8; PAGE_SIZE], [0u8; PAGE_SIZE]);
+    fill(kind, &mut msr, &mut io_a, &mut io_b);
+    (msr, io_a, io_b)
+}
+
+fn ones(page: &[u8]) -> u32 {
+    page.iter().map(|byte| byte.count_ones()).sum()
+}
+
 #[test]
 fn fill_sets_exactly_the_intercepted_bits() {
-    let (mut msr, mut io_a, mut io_b) = ([0u8; PAGE_SIZE], [0u8; PAGE_SIZE], [0u8; PAGE_SIZE]);
-    fill(&mut msr, &mut io_a, &mut io_b);
-    let ones = |page: &[u8]| page.iter().map(|byte| byte.count_ones()).sum::<u32>();
+    let (msr, io_a, io_b) = filled(GuestKind::BuiltInTest);
     assert_eq!(msr[0x420], 1 << 2);
     assert_eq!(msr[0xC20], 1 << 2);
     // IA32_KERNEL_GS_BASE and the 76 MTRR addresses, each read and write.
@@ -69,9 +78,18 @@ fn fill_sets_exactly_the_intercepted_bits() {
 }
 
 #[test]
+fn the_firmware_exits_for_the_mtrrs_only() {
+    let (msr, io_a, io_b) = filled(GuestKind::Firmware);
+    // No IA32_KERNEL_GS_BASE: the 76 MTRR addresses alone, read and write.
+    assert_eq!((msr[0x420], msr[0xC20]), (0, 0));
+    assert_eq!(ones(&msr), 2 * 76);
+    // No port at all, so no IN, OUT, INS or OUTS exits.
+    assert_eq!((ones(&io_a), ones(&io_b)), (0, 0));
+}
+
+#[test]
 fn fill_intercepts_both_ways_every_mtrr_address_whatever_the_cpu_has() {
-    let (mut msr, mut io_a, mut io_b) = ([0u8; PAGE_SIZE], [0u8; PAGE_SIZE], [0u8; PAGE_SIZE]);
-    fill(&mut msr, &mut io_a, &mut io_b);
+    let (msr, _, _) = filled(GuestKind::BuiltInTest);
     let intercepted = |address: u32, access| {
         let (offset, bit) = msr_bit(address, access).unwrap();
         msr[offset] & (1 << bit) != 0

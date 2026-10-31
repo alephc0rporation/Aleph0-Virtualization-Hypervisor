@@ -1,6 +1,6 @@
 //! Instructions Aleph0 executes for the guest: passthrough emulation.
 //!
-//! Some guest instructions always exit (CPUID). Others exit because the
+//! Some guest instructions always exit (CPUID, XSETBV). Others exit because the
 //! exit bitmaps ask for it (RDMSR/WRMSR through the MSR bitmap, IN/OUT through
 //! the I/O bitmaps, both in `vmx::exit_bitmaps`). A handler here decides
 //! what to execute. `vmexit::handler` then runs the real
@@ -31,15 +31,21 @@
 use core::arch::x86_64::CpuidResult;
 
 use super::{ExitEvent, ExitInfo};
+use crate::vmx::cr::{CR4_OSXSAVE, CR4_PKE};
 use crate::vmx::exit_bitmaps::{INTERCEPTED_MSRS, MsrAccess, msr_bit};
+use crate::vmx::features::{CPUID_1_ECX_OSXSAVE, GuestFeatures};
 use crate::vmx::hyperv;
 use crate::vmx::mtrr::{self, MtrrCapabilities, MtrrMsr};
 
 /// An instruction the exit handler executes for the guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Emulation {
-    /// CPUID with EAX = `leaf`, ECX = `subleaf`.
-    Cpuid { leaf: u32, subleaf: u32 },
+    /// CPUID with EAX = `leaf`, ECX = `subleaf`, from a guest whose CR4 is
+    /// `guest_cr4` (GUEST_CR4), which the bits mirroring CR4 follow.
+    Cpuid { leaf: u32, subleaf: u32, guest_cr4: u64 },
+    /// XSETBV of `value` (EDX:EAX) to XCR0. `value` is one XSETBV takes
+    /// ([`xcr0_valid`]), so the real XSETBV cannot fault.
+    Xsetbv { value: u64 },
     /// RDMSR of `msr`, an intercepted MSR.
     Rdmsr { msr: u32 },
     /// WRMSR of `value` (EDX:EAX) to `msr`, an intercepted MSR. `value` is
@@ -68,22 +74,51 @@ pub enum Emulation {
 
 /// CPUID.1:ECX bit 5: VMX.
 const CPUID_1_ECX_VMX: u32 = 1 << 5;
+/// CPUID.(EAX=7,ECX=0):ECX bit 4: OSPKE, a copy of CR4.PKE.
+const CPUID_7_ECX_OSPKE: u32 = 1 << 4;
 
-/// What the guest sees for CPUID `leaf`, given what the processor returned
-/// in root operation.
+/// `bit` if `cr4` has `cr4_bit` set, else 0.
+fn mirrors(cr4: u64, cr4_bit: u64, bit: u32) -> u32 {
+    if cr4 & cr4_bit != 0 { bit } else { 0 }
+}
+
+/// What the guest sees for CPUID `leaf`/`subleaf`, given what the processor
+/// returned in root operation (`raw`), the guest's CR4 (`guest_cr4`) and what
+/// bring-up offers it (`features`):
 ///
-/// Everything passes through except CPUID.1:ECX.VMX. A guest that saw it
-/// would try VMXON, which always exits (reason 27), and Aleph0 does not
-/// emulate VMX. Left as the processor says:
+/// - CPUID.1:ECX.VMX is cleared. A guest that saw it would try VMXON, which
+///   always exits (reason 27), and Aleph0 does not emulate VMX.
+/// - CPUID.1:ECX.OSXSAVE and CPUID.(7,0):ECX.OSPKE copy the guest's
+///   CR4.OSXSAVE and CR4.PKE. CPUID runs in root operation, where they copy
+///   HOST_CR4, not the guest's.
+/// - The bits of what bring-up does not offer are cleared
+///   ([`GuestFeatures::hidden`]): their instructions would #UD in the guest.
+///
+/// Left as the processor says:
 /// - ECX bit 31 (hypervisor present) and the leaves from 0x40000000, which
 ///   under Hyper-V describe Hyper-V: the guest keeps Hyper-V's interface,
 ///   and Aleph0 forwards it (docs/HYPERV_INTERFACE.md);
-/// - values that depend on CR4 and XCR0 (CPUID.1:ECX.OSXSAVE, leaf 0xD),
-///   which are right for the guest only while it shares the host's.
-pub fn cpuid_policy(leaf: u32, raw: CpuidResult) -> CpuidResult {
-    match leaf {
-        1 => CpuidResult {
-            ecx: raw.ecx & !CPUID_1_ECX_VMX,
+/// - leaf 0xD's sizes, which follow XCR0. VM entry and exit do not switch
+///   XCR0, and only the guest's XSETBV changes it, so they are the guest's.
+pub fn cpuid_policy(leaf: u32, subleaf: u32, raw: CpuidResult, guest_cr4: u64, features: GuestFeatures) -> CpuidResult {
+    let hidden = features.hidden();
+    match (leaf, subleaf) {
+        (1, _) => CpuidResult {
+            ecx: (raw.ecx & !(CPUID_1_ECX_VMX | CPUID_1_ECX_OSXSAVE | hidden.leaf_1_ecx))
+                | mirrors(guest_cr4, CR4_OSXSAVE, CPUID_1_ECX_OSXSAVE),
+            ..raw
+        },
+        (7, 0) => CpuidResult {
+            ebx: raw.ebx & !hidden.leaf_7_ebx,
+            ecx: (raw.ecx & !(CPUID_7_ECX_OSPKE | hidden.leaf_7_ecx)) | mirrors(guest_cr4, CR4_PKE, CPUID_7_ECX_OSPKE),
+            ..raw
+        },
+        (0xD, 1) => CpuidResult {
+            eax: raw.eax & !hidden.leaf_d_1_eax,
+            ..raw
+        },
+        (0x8000_0001, _) => CpuidResult {
+            edx: raw.edx & !hidden.extended_edx,
             ..raw
         },
         _ => raw,
@@ -91,12 +126,61 @@ pub fn cpuid_policy(leaf: u32, raw: CpuidResult) -> CpuidResult {
 }
 
 /// CPUID (exit reason 10), which always exits: execute it with the guest's
-/// EAX (leaf) and ECX (subleaf).
+/// EAX (leaf) and ECX (subleaf), for its CR4.
 pub(super) fn cpuid(exit: &ExitInfo) -> ExitEvent {
     ExitEvent::Emulated(Emulation::Cpuid {
         leaf: exit.guest_rax as u32,
         subleaf: exit.guest_rcx as u32,
+        guest_cr4: exit.guest_cr4,
     })
+}
+
+// XCR0 components with rules of their own (Intel SDM Vol. 1, "Enabling the
+// XSAVE Feature Set and XSAVE-Enabled Features").
+/// Bit 0: x87 state, which is always on.
+const XCR0_X87: u64 = 1 << 0;
+/// Bit 1: SSE state.
+const XCR0_SSE: u64 = 1 << 1;
+/// Bit 2: AVX state, which needs SSE.
+const XCR0_AVX: u64 = 1 << 2;
+/// Bits 4:3: MPX's BNDREGS and BNDCSR, both or neither.
+const XCR0_MPX: u64 = 0b11 << 3;
+/// Bits 7:5: AVX-512's opmask, ZMM_Hi256 and Hi16_ZMM, all or none, and only
+/// with SSE and AVX.
+const XCR0_AVX512: u64 = 0b111 << 5;
+/// Bits 18:17: AMX's XTILECFG and XTILEDATA, both or neither.
+const XCR0_AMX: u64 = 0b11 << 17;
+
+/// Whether XSETBV takes `value` for XCR0 on a CPU supporting the XCR0 bits
+/// `supported`, as the SDM's XSETBV lists the #GP(0) cases: no bit outside
+/// `supported`, x87 set, AVX only with SSE, AVX-512 all or none and only with
+/// SSE and AVX, MPX and AMX both or neither.
+pub fn xcr0_valid(value: u64, supported: u64) -> bool {
+    let all_or_none = |bits: u64| value & bits == 0 || value & bits == bits;
+    let sse_avx = XCR0_SSE | XCR0_AVX;
+    value & !supported == 0
+        && value & XCR0_X87 != 0
+        && (value & XCR0_AVX == 0 || value & XCR0_SSE != 0)
+        && all_or_none(XCR0_AVX512)
+        && (value & XCR0_AVX512 == 0 || value & sse_avx == sse_avx)
+        && all_or_none(XCR0_MPX)
+        && all_or_none(XCR0_AMX)
+}
+
+/// XSETBV (exit reason 55), which always exits: of EDX:EAX to the XCR in
+/// ECX, executed in root operation when it is XCR0 and a value XCR0 takes,
+/// #GP(0) otherwise. The CPU raises #UD (guest CR4.OSXSAVE clear) and #GP
+/// (CPL > 0) before the exit, so only the value is checked here (Intel SDM
+/// Vol. 3C, "Relative Priority of Faults and VM Exits"). Without XSETBV in
+/// root operation the supported bits are 0, so every value gets the #GP.
+pub(super) fn xsetbv(exit: &ExitInfo) -> ExitEvent {
+    // EDX:EAX, as for WRMSR.
+    let value = wrmsr_value(exit);
+    if exit.guest_rcx as u32 == 0 && xcr0_valid(value, exit.xcr0_supported) {
+        ExitEvent::Emulated(Emulation::Xsetbv { value })
+    } else {
+        ExitEvent::GuestGeneralProtection
+    }
 }
 
 /// HLT (exit reason 12): resume past it without halting. A halted vCPU

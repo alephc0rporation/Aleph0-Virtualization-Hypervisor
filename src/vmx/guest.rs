@@ -21,10 +21,12 @@
 //! write and re-delivers the interrupted NMI (`exit_decision`).
 //!
 //! Before that, the guest runs the instructions Aleph0 emulates (CPUID,
-//! RDMSR/WRMSR of IA32_KERNEL_GS_BASE, IN/OUT of the COM1 scratch register)
-//! and checks each result itself. A wrong one ends in `ud2` with
-//! [`GUEST_EMULATION_FAIL_MARKER`] in EAX. MSRs and ports it writes are real
-//! hardware, so it saves each one first and restores it afterwards. Then it
+//! RDMSR/WRMSR of IA32_KERNEL_GS_BASE, IN/OUT of the COM1 scratch register,
+//! XSETBV with CR4.OSXSAVE set for it) and checks each result itself, then
+//! one RDTSCP, which only the "enable RDTSCP" control keeps from #UD. A
+//! wrong result ends in `ud2` with [`GUEST_EMULATION_FAIL_MARKER`] in EAX.
+//! MSRs, ports and XCR0 it writes are real hardware, so it saves each one
+//! first and restores it afterwards. Then it
 //! moves its last variable MTRR to [`GUEST_MTRR_BASE`] and back, which
 //! reaches only Aleph0's copy of its MTRRs and the EPT memory types. Then it
 //! reads the Local APIC's version register, device memory above RAM that
@@ -54,6 +56,7 @@ use super::cpuid::ADDRESS_SIZES;
 use super::cr::{self, read_cr4};
 use super::ept::SIZE_2M;
 use super::exit_decision::NMI_VECTOR;
+use super::features::CPUID_1_ECX_OSXSAVE;
 use super::msr::IA32_KERNEL_GS_BASE;
 use super::mtrr::{self, IA32_MTRR_PHYSBASE0, IA32_MTRRCAP, PHYSMASK_VALID};
 use super::page::{PAGE_SIZE, RESIDENT_CODE, allocate_zeroed_page, allocate_zeroed_pages_of_type};
@@ -107,6 +110,11 @@ pub const GUEST_MSR_VALUE: u64 = 0x0000_7A1E_0000_0000;
 /// back. The guest puts the original back afterwards.
 pub const GUEST_IO_VALUE: u8 = 0xA5;
 
+/// XCR0 the guest writes with XSETBV through Aleph0 and reads back with
+/// XGETBV: x87 and SSE, which every CPU with XSAVE supports. The guest puts
+/// the original back afterwards.
+pub const GUEST_XCR0_VALUE: u32 = 0x3;
+
 /// Where the guest moves its last variable MTRR, making it UC: the 2 MiB
 /// region at 2 MiB. Every identity map reaches it (it spans at least 1 GiB),
 /// and UEFI allocates far above it, so nothing the guest runs on is there.
@@ -121,17 +129,18 @@ pub const GUEST_MTRR_BASE: u64 = SIZE_2M;
 pub const GUEST_EMULATION_FAIL_MARKER: u32 = 0xFA11;
 
 /// The exit statistics a finished run of the guest must end with, given the
-/// run's own (`actual`): two CPUIDs (leaf 1 and the address sizes), two
-/// RDMSRs and two WRMSRs of IA32_KERNEL_GS_BASE, three RDMSRs and seven
-/// WRMSRs of its last variable MTRR, two INs and two OUTs of the COM1
-/// scratch register, one HLT, no exception injected, and nothing forwarded
-/// to Hyper-V: its VMCALLs are its script's. Bring-up compares
+/// run's own (`actual`): three CPUIDs (leaf 1 twice, the address sizes), two
+/// XSETBVs, two RDMSRs and two WRMSRs of IA32_KERNEL_GS_BASE, three RDMSRs
+/// and seven WRMSRs of its last variable MTRR, two INs and two OUTs of the
+/// COM1 scratch register, one HLT, no exception injected, and nothing
+/// forwarded to Hyper-V: its VMCALLs are its script's. Bring-up compares
 /// the two once the guest has finished. The number of exits and of NMIs
 /// injected depend on whether an NMI arrived during the run, so they are
 /// taken from `actual`.
 pub fn expected_stats(actual: &VcpuStats) -> VcpuStats {
     VcpuStats {
-        cpuid_exits: 2,
+        cpuid_exits: 3,
+        xsetbv_exits: 2,
         msr_read_exits: 2,
         msr_write_exits: 2,
         mtrr_read_exits: 3,
@@ -194,6 +203,40 @@ guest_code_start:
     jne guest_emulation_failed
     mov al, sil
     out dx, al
+    // XSETBV always exits; Aleph0 checks the value and runs it in root
+    // operation. Turn CR4.OSXSAVE on (the CR4 mask leaves it to the guest),
+    // which CPUID.1:ECX.OSXSAVE must then show. Save XCR0, write
+    // GUEST_XCR0_VALUE, read it back, put the saved value back, and turn
+    // OSXSAVE off again. XGETBV does not exit.
+    mov rax, cr4
+    bts rax, {cr4_osxsave_bit}
+    mov cr4, rax
+    mov eax, 1
+    xor ecx, ecx
+    cpuid
+    bt ecx, {cpuid_osxsave_bit}
+    jnc guest_emulation_failed
+    xor ecx, ecx
+    xgetbv
+    mov esi, eax
+    mov edi, edx
+    mov eax, {xcr0_value}
+    xor edx, edx
+    xsetbv
+    xgetbv
+    cmp eax, {xcr0_value}
+    jne guest_emulation_failed
+    test edx, edx
+    jnz guest_emulation_failed
+    mov eax, esi
+    mov edx, edi
+    xsetbv
+    mov rax, cr4
+    btr rax, {cr4_osxsave_bit}
+    mov cr4, rax
+    // RDTSCP runs without an exit with "enable RDTSCP" on, and is #UD
+    // without it.
+    rdtscp
     // The MTRRs exit through the MSR bitmap; Aleph0 keeps a copy for the
     // guest and never writes the CPU's. A PHYSMASK holds the address bits
     // below MAXPHYADDR (CPUID.80000008H:EAX[7:0]): R10 = those bits.
@@ -353,6 +396,9 @@ guest_code_end:
     msr_high = const (GUEST_MSR_VALUE >> 32) as u32,
     scratch_port = const GUEST_SCRATCH_PORT,
     io_value = const GUEST_IO_VALUE,
+    cr4_osxsave_bit = const cr::CR4_OSXSAVE.trailing_zeros(),
+    cpuid_osxsave_bit = const CPUID_1_ECX_OSXSAVE.trailing_zeros(),
+    xcr0_value = const GUEST_XCR0_VALUE,
     address_sizes = const ADDRESS_SIZES,
     mtrrcap = const IA32_MTRRCAP,
     physbase0 = const IA32_MTRR_PHYSBASE0,

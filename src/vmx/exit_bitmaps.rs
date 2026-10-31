@@ -34,12 +34,14 @@ use super::msr::{
 use super::mtrr;
 use super::page::{PAGE_SIZE, allocate_zeroed_page};
 use super::vmcs::fields::{IO_BITMAP_A, IO_BITMAP_B, MSR_BITMAP};
-use super::vmcs::{self, VmcsError};
+use super::vmcs::{self, GuestKind, VmcsError};
 
-/// MSRs whose RDMSR and WRMSR exit to Aleph0, which passes them through: it
-/// runs a real RDMSR/WRMSR in root operation, which reaches the CPU's own
-/// MSR, so none may be in [`VMCS_HELD_MSRS`] (checked at compile time
-/// below).
+/// MSRs whose RDMSR and WRMSR exit to Aleph0 in the test guest, which passes
+/// them through: it runs a real RDMSR/WRMSR in root operation, which reaches
+/// the CPU's own MSR, so none may be in [`VMCS_HELD_MSRS`] (checked at compile
+/// time below). They test the bitmap and the passthrough (`vmx::guest`); for
+/// the firmware or an OS each exit would only repeat the access, so they do
+/// not exit there ([`ExitBitmaps::allocate`]).
 ///
 /// The MTRR MSRs exit too ([`ExitBitmaps::allocate`]), but are never
 /// passed through: the guest reads and writes a copy of them
@@ -50,7 +52,8 @@ use super::vmcs::{self, VmcsError};
 /// holds there.
 pub const INTERCEPTED_MSRS: [u32; 1] = [IA32_KERNEL_GS_BASE];
 
-/// Ports whose IN and OUT exit to Aleph0.
+/// Ports whose IN and OUT exit to Aleph0 in the test guest, like
+/// [`INTERCEPTED_MSRS`].
 pub const INTERCEPTED_PORTS: [u16; 1] = [GUEST_SCRATCH_PORT];
 
 /// MSRs whose guest value is a VMCS guest-state field. In root operation a
@@ -125,11 +128,22 @@ pub const fn io_bit(port: u16) -> (IoBitmap, usize, u8) {
     (page, index / 8, (port % 8) as u8)
 }
 
-/// Sets the bits of [`INTERCEPTED_MSRS`] and of every address an MTRR MSR
-/// can have (read and write), and of [`INTERCEPTED_PORTS`], in zeroed
-/// bitmap pages.
-fn fill(msr: &mut [u8], io_a: &mut [u8], io_b: &mut [u8]) {
-    for intercepted in INTERCEPTED_MSRS.into_iter().chain(mtrr::every_msr_address()) {
+/// The MSRs and ports a `kind` guest's RDMSR, WRMSR, IN and OUT exit for
+/// besides the MTRRs: [`INTERCEPTED_MSRS`] and [`INTERCEPTED_PORTS`] for the
+/// test guest, none for the firmware.
+pub fn intercepted(kind: GuestKind) -> (&'static [u32], &'static [u16]) {
+    match kind {
+        GuestKind::BuiltInTest => (&INTERCEPTED_MSRS, &INTERCEPTED_PORTS),
+        GuestKind::Firmware => (&[], &[]),
+    }
+}
+
+/// Sets, in zeroed bitmap pages, the bits of every address an MTRR MSR can
+/// have (read and write), and of the MSRs and ports [`intercepted`] gives a
+/// `kind` guest.
+fn fill(kind: GuestKind, msr: &mut [u8], io_a: &mut [u8], io_b: &mut [u8]) {
+    let (msrs, ports) = intercepted(kind);
+    for intercepted in msrs.iter().copied().chain(mtrr::every_msr_address()) {
         for access in [MsrAccess::Read, MsrAccess::Write] {
             // Always `Some`: checked at compile time above, and every MTRR
             // MSR is below 0x300.
@@ -138,7 +152,7 @@ fn fill(msr: &mut [u8], io_a: &mut [u8], io_b: &mut [u8]) {
             }
         }
     }
-    for port in INTERCEPTED_PORTS {
+    for &port in ports {
         let (page, offset, bit) = io_bit(port);
         let page = match page {
             IoBitmap::A => &mut *io_a,
@@ -163,10 +177,12 @@ pub struct ExitBitmaps {
 }
 
 impl ExitBitmaps {
-    /// Allocates three zeroed pages and sets the intercepted bits: those of
-    /// [`INTERCEPTED_MSRS`], of every address an MTRR MSR can have, and of
-    /// [`INTERCEPTED_PORTS`].
-    pub fn allocate() -> Result<Self, ExitBitmapsError> {
+    /// Allocates three zeroed pages and sets the bits a `kind` guest exits
+    /// for ([`fill`]): every address an MTRR MSR can have, and for the test
+    /// guest [`INTERCEPTED_MSRS`] and [`INTERCEPTED_PORTS`]. The firmware's
+    /// I/O bitmaps stay all zero, so its IN, OUT, INS and OUTS never exit,
+    /// and of its MSRs in the two ranges only the MTRRs do.
+    pub fn allocate(kind: GuestKind) -> Result<Self, ExitBitmapsError> {
         let page = || allocate_zeroed_page(ExitBitmapsError::AllocationFailed);
         let bitmaps = Self {
             msr: page()?,
@@ -182,7 +198,7 @@ impl ExitBitmaps {
                 core::slice::from_raw_parts_mut(bitmaps.io_b.as_ptr(), PAGE_SIZE),
             )
         };
-        fill(msr, io_a, io_b);
+        fill(kind, msr, io_a, io_b);
         Ok(bitmaps)
     }
 

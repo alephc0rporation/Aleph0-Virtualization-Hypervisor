@@ -7,10 +7,10 @@
 
 use super::scenario::{BLOCKING_BY_MOV_SS, BLOCKING_BY_NMI, BLOCKING_BY_STI};
 use super::*;
-use crate::vmx::cr::{CR0_NE, CR0_PE, CR0_PG, CR4_VMXE, CrFixed};
+use crate::vmx::cr::{CR0_NE, CR0_PE, CR0_PG, CR4_OSXSAVE, CR4_VMXE, CrFixed};
 use crate::vmx::guest::{
     GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_IO_VALUE, GUEST_MARKER, GUEST_MSR_VALUE, GUEST_MTRR_BASE, GUEST_NMI_MARKER,
-    GUEST_SCRATCH_PORT, expected_stats,
+    GUEST_SCRATCH_PORT, GUEST_XCR0_VALUE, expected_stats,
 };
 use crate::vmx::mtrr::MtrrCapabilities;
 use crate::vmx::vmexit::VcpuStats;
@@ -77,6 +77,8 @@ fn exit(basic: u16) -> ExitInfo {
         guest_cpl: 0,
         cr_source: 0,
         cr_fixed: CrFixed::NONE,
+        guest_cr4: 0,
+        xcr0_supported: 0,
     }
 }
 
@@ -1071,7 +1073,11 @@ fn each_event_maps_to_its_action() {
     assert_eq!(ExitEvent::EptWriteMissing.action(), ExitAction::Unexpected);
     assert_eq!(ExitEvent::DataPageMismatch.action(), ExitAction::Unexpected);
     assert_eq!(ExitEvent::Unexpected.action(), ExitAction::Unexpected);
-    let cpuid = Emulation::Cpuid { leaf: 1, subleaf: 0 };
+    let cpuid = Emulation::Cpuid {
+        leaf: 1,
+        subleaf: 0,
+        guest_cr4: 0,
+    };
     assert_eq!(
         ExitEvent::Emulated(cpuid).action(),
         ExitAction::Resume(ResumePlan {
@@ -1269,6 +1275,13 @@ fn emulated_exits() -> Vec<ExitInfo> {
         mtrr: MtrrCapabilities::new((1 << 8) | 8, 46).unwrap(),
         ..exit(basic)
     };
+    let xsetbv = |value: u64| ExitInfo {
+        guest_rax: value,
+        guest_rcx: 0,
+        guest_rdx: 0,
+        xcr0_supported: 0xE7,
+        ..exit(EXIT_REASON_XSETBV)
+    };
     vec![
         ExitInfo {
             guest_rax: 1,
@@ -1283,6 +1296,15 @@ fn emulated_exits() -> Vec<ExitInfo> {
         io(false, GUEST_IO_VALUE.into()),
         io(true, 0),
         io(false, 0),
+        // CR4.OSXSAVE on, then XCR0 written and put back.
+        ExitInfo {
+            guest_rax: 1,
+            guest_rcx: 0,
+            guest_cr4: CR4_OSXSAVE,
+            ..exit(EXIT_REASON_CPUID)
+        },
+        xsetbv(GUEST_XCR0_VALUE.into()),
+        xsetbv(0x1),
         ExitInfo {
             guest_rax: 0x8000_0008,
             ..exit(EXIT_REASON_CPUID)
@@ -1313,8 +1335,30 @@ fn cpuid_exit_is_dispatched_to_emulation() {
     };
     assert_eq!(
         decide(GuestKind::BuiltInTest, START, cpuid).0,
-        ExitEvent::Emulated(Emulation::Cpuid { leaf: 1, subleaf: 0 })
+        ExitEvent::Emulated(Emulation::Cpuid {
+            leaf: 1,
+            subleaf: 0,
+            guest_cr4: 0,
+        })
     );
+}
+
+#[test]
+fn xsetbv_exit_is_dispatched_to_emulation_for_any_guest() {
+    let xsetbv = ExitInfo {
+        guest_rax: 0x3,
+        guest_rcx: 0,
+        guest_rdx: 0,
+        xcr0_supported: 0xE7,
+        ..exit(EXIT_REASON_XSETBV)
+    };
+    for guest in [GuestKind::BuiltInTest, GuestKind::Firmware] {
+        assert_eq!(
+            decide(guest, START, xsetbv).0,
+            ExitEvent::Emulated(Emulation::Xsetbv { value: 0x3 })
+        );
+    }
+    assert_eq!(exit_reason_name(EXIT_REASON_XSETBV), "XSETBV");
 }
 
 #[test]
@@ -1335,7 +1379,7 @@ fn whole_guest_run_finishes_with_the_expected_stats() {
     }
     assert_eq!(event, ExitEvent::LastMainVmcall);
     assert_eq!(stats, expected_stats(&stats));
-    assert_eq!((stats.exits, stats.nmi_injections), (24, 0));
+    assert_eq!((stats.exits, stats.nmi_injections), (27, 0));
 }
 
 #[test]

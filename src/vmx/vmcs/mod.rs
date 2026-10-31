@@ -72,12 +72,13 @@ impl DesiredControls {
     /// (`vmx::exit_bitmaps`), and HLT exiting. Hyper-V forces HLT exiting
     /// anyway; requesting it means a guest HLT with IF = 0 exits on every
     /// CPU instead of halting it for good. The exception bitmap depends on
-    /// `kind`.
-    pub const fn minimal_64_bit_guest(kind: GuestKind) -> Self {
+    /// `kind`; the secondary controls are `secondary`
+    /// (`features::secondary_request`: EPT and those an OS guest needs).
+    pub const fn minimal_64_bit_guest(kind: GuestKind, secondary: u32) -> Self {
         Self {
             pin: PIN_BASED_NMI_EXITING | PIN_BASED_VIRTUAL_NMIS,
             primary: CPU_BASED_HLT_EXITING | CPU_BASED_USE_IO_BITMAPS | CPU_BASED_USE_MSR_BITMAPS,
-            secondary: SECONDARY_ENABLE_EPT,
+            secondary,
             exit: VM_EXIT_HOST_ADDRESS_SPACE_SIZE,
             entry: VM_ENTRY_IA32E_MODE_GUEST,
             exception_bitmap: exception_bitmap(kind),
@@ -444,6 +445,11 @@ pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: Desire
         write_verified(VM_ENTRY_CONTROLS, entry.into())?;
         if let Some(secondary) = secondary {
             write_verified(SECONDARY_VM_EXEC_CONTROL, secondary.into())?;
+            // No XSAVES/XRSTORS exit for any component. The field exists
+            // only with the control allowed, and VMCLEAR does not zero it.
+            if secondary & SECONDARY_ENABLE_XSAVES != 0 {
+                write_verified(XSS_EXIT_BITMAP, 0)?;
+            }
         }
 
         // VM entry checks these fields, and VMCLEAR does not guarantee that
@@ -494,20 +500,21 @@ pub struct HostTables {
 }
 
 /// Write the host state to the current VMCS: `tables` for CR3, the
-/// descriptor tables and the selectors; the running CPU for CR0, CR4, the FS
-/// and GS bases and the SYSENTER MSRs, which VM exits restore as they are now.
-/// Do not use this as evidence that VM entry is ready until all host fields
-/// required by the selected VM-exit controls have been populated.
+/// descriptor tables and the selectors; `cr4` for CR4; the running CPU for
+/// CR0, the FS and GS bases and the SYSENTER MSRs, which VM exits restore as
+/// they are now. Do not use this as evidence that VM entry is ready until all
+/// host fields required by the selected VM-exit controls have been populated.
 ///
 /// # Safety
 ///
 /// VMX operation must be active and a VMCS current on this CPU. `tables`
 /// must describe page tables, a GDT, a TSS and an IDT that stay live and
-/// usable for as long as a VM exit can load them.
-pub unsafe fn configure_host_state(tables: &HostTables) -> Result<(), VmcsError> {
+/// usable for as long as a VM exit can load them. `cr4` must be the running
+/// CR4, with at most bits added that the exit handler and the code it
+/// returns to can run with (`features::GuestFeatures::host_cr4`).
+pub unsafe fn configure_host_state(tables: &HostTables, cr4: u64) -> Result<(), VmcsError> {
     let selectors = tables.selectors;
     let cr0 = cr::read_cr0();
-    let cr4 = cr::read_cr4();
     // SAFETY: UEFI runs in long mode, which has both MSRs.
     let (fs_base, gs_base) = unsafe { (segment::read_fs_base(), segment::read_gs_base()) };
     // SAFETY: the SYSENTER MSRs exist on every x86_64 CPU, and reading

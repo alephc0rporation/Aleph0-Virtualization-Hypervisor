@@ -144,8 +144,10 @@ With these masks:
 
 ## 6. Out of scope
 
-- CR4.OSXSAVE, XSETBV and the CPUID bits that follow CR4 (#25). OSXSAVE is not
-  an owned bit, so setting it does not exit.
+- CR4.OSXSAVE, XSETBV and the CPUID bits that follow CR4: #25
+  ([EMULATED_EXITS.md](EMULATED_EXITS.md) sections 3 and 3a). OSXSAVE is not
+  an owned bit, so setting it does not exit; the #25 test guest's MOV to CR4
+  confirmed that on Hyper-V.
 - Unrestricted guest and a guest that leaves protected mode or paging, needed
   for INIT/SIPI with multiple vCPUs: after the first boot. Clearing CR0.PE or
   CR0.PG stops until then.

@@ -6,7 +6,8 @@
 
 use super::*;
 use crate::vmx::exit_decision::{
-    EXIT_REASON_CPUID, EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_RDMSR, EXIT_REASON_WRMSR, ExitReason, InterruptionInfo,
+    EXIT_REASON_CPUID, EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_RDMSR, EXIT_REASON_WRMSR, EXIT_REASON_XSETBV,
+    ExitReason, InterruptionInfo,
 };
 use crate::vmx::mtrr::{self, MtrrCapabilities};
 
@@ -42,13 +43,34 @@ fn exit(basic: u16) -> ExitInfo {
         guest_cpl: 0,
         cr_source: 0,
         cr_fixed: crate::vmx::cr::CrFixed::NONE,
+        guest_cr4: 0,
+        xcr0_supported: 0,
     }
 }
+
+/// What Hyper-V offers (`features.rs` tests): every optional secondary
+/// control, and XSETBV with x87, SSE, AVX and AVX-512.
+const OFFERED: GuestFeatures = GuestFeatures {
+    secondary: 0x0410_100A,
+    xcr0: 0xE7,
+};
+/// Nothing beyond EPT, no XSETBV.
+const NOTHING_OFFERED: GuestFeatures = GuestFeatures::NONE;
+/// Every bit set, so a cleared one shows.
+const ALL_ONES: CpuidResult = CpuidResult {
+    eax: u32::MAX,
+    ebx: u32::MAX,
+    ecx: u32::MAX,
+    edx: u32::MAX,
+};
+/// A guest CR4 with OSXSAVE and PKE.
+const CR4_OSXSAVE_PKE: u64 = CR4_OSXSAVE | CR4_PKE;
 
 #[test]
 fn leaf_1_hides_vmx_and_nothing_else() {
     assert_ne!(LEAF_1.ecx & (1 << 5), 0);
-    let guest = cpuid_policy(1, LEAF_1);
+    // LEAF_1 has OSXSAVE (bit 27) set, as this guest's CR4.
+    let guest = cpuid_policy(1, 0, LEAF_1, CR4_OSXSAVE, OFFERED);
     assert_eq!(guest.ecx, LEAF_1.ecx & !(1 << 5));
     assert_eq!((guest.eax, guest.ebx, guest.edx), (LEAF_1.eax, LEAF_1.ebx, LEAF_1.edx));
 }
@@ -59,13 +81,60 @@ fn leaf_1_without_vmx_is_unchanged() {
         ecx: LEAF_1.ecx & !(1 << 5),
         ..LEAF_1
     };
-    assert_eq!(cpuid_policy(1, no_vmx), no_vmx);
+    assert_eq!(cpuid_policy(1, 0, no_vmx, CR4_OSXSAVE, OFFERED), no_vmx);
+}
+
+#[test]
+fn osxsave_and_ospke_follow_the_guests_cr4_whatever_the_processor_said() {
+    let osxsave = |raw: CpuidResult, cr4| cpuid_policy(1, 0, raw, cr4, OFFERED).ecx & (1 << 27);
+    let ospke = |raw: CpuidResult, cr4| cpuid_policy(7, 0, raw, cr4, OFFERED).ecx & (1 << 4);
+    let none = CpuidResult { ecx: 0, ..ALL_ONES };
+    for raw in [ALL_ONES, none] {
+        assert_eq!(osxsave(raw, CR4_OSXSAVE_PKE), 1 << 27);
+        assert_eq!(osxsave(raw, 0), 0);
+        assert_eq!(ospke(raw, CR4_OSXSAVE_PKE), 1 << 4);
+        assert_eq!(ospke(raw, 0), 0);
+    }
+}
+
+#[test]
+fn what_is_offered_keeps_its_cpuid_bits() {
+    for (leaf, subleaf) in [(7, 0), (0xD, 1), (0x8000_0001, 0)] {
+        assert_eq!(
+            cpuid_policy(leaf, subleaf, ALL_ONES, CR4_OSXSAVE_PKE, OFFERED),
+            ALL_ONES,
+            "{leaf:#x},{subleaf}"
+        );
+    }
+    // Leaf 1 loses VMX only.
+    assert_eq!(cpuid_policy(1, 0, ALL_ONES, CR4_OSXSAVE_PKE, OFFERED).ecx, !(1 << 5));
+}
+
+#[test]
+fn what_is_not_offered_loses_its_cpuid_bits() {
+    let guest = |leaf, subleaf| cpuid_policy(leaf, subleaf, ALL_ONES, CR4_OSXSAVE_PKE, NOTHING_OFFERED);
+    // XSAVE without XSETBV; VMX as always.
+    assert_eq!(guest(1, 0).ecx, !((1 << 26) | (1 << 5)));
+    // INVPCID; RDPID and WAITPKG.
+    assert_eq!(guest(7, 0).ebx, !(1 << 10));
+    assert_eq!(guest(7, 0).ecx, !((1 << 22) | (1 << 5)));
+    // XSAVES.
+    assert_eq!(guest(0xD, 1).eax, !(1 << 3));
+    // RDTSCP.
+    assert_eq!(guest(0x8000_0001, 0).edx, !(1 << 27));
+    // Leaf 7 subleaf 1 and leaf 0xD subleaf 0 are other registers' bits.
+    assert_eq!(guest(7, 1), ALL_ONES);
+    assert_eq!(guest(0xD, 0), ALL_ONES);
 }
 
 #[test]
 fn other_leaves_pass_through() {
-    for leaf in [0, 7, 0xD, 0x4000_0000, 0x8000_0001] {
-        assert_eq!(cpuid_policy(leaf, LEAF_1), LEAF_1, "leaf {leaf:#x}");
+    for leaf in [0, 0xD, 0x4000_0000, 0x8000_0008] {
+        assert_eq!(
+            cpuid_policy(leaf, 0, LEAF_1, 0, NOTHING_OFFERED),
+            LEAF_1,
+            "leaf {leaf:#x}"
+        );
     }
 }
 
@@ -74,12 +143,83 @@ fn cpuid_takes_leaf_and_subleaf_from_the_low_halves_of_rax_and_rcx() {
     let cpuid_exit = ExitInfo {
         guest_rax: 0xFFFF_FFFF_0000_0007,
         guest_rcx: 0x0000_0001_0000_0001,
+        guest_cr4: CR4_OSXSAVE,
         ..exit(EXIT_REASON_CPUID)
     };
     assert_eq!(
         cpuid(&cpuid_exit),
-        ExitEvent::Emulated(Emulation::Cpuid { leaf: 7, subleaf: 1 })
+        ExitEvent::Emulated(Emulation::Cpuid {
+            leaf: 7,
+            subleaf: 1,
+            guest_cr4: CR4_OSXSAVE,
+        })
     );
+}
+
+/// An XSETBV of `value` (EDX:EAX) to XCR `xcr` on a CPU supporting
+/// `supported`.
+fn xsetbv_exit(xcr: u64, value: u64, supported: u64) -> ExitInfo {
+    ExitInfo {
+        guest_rcx: xcr,
+        guest_rax: value & 0xFFFF_FFFF,
+        guest_rdx: value >> 32,
+        xcr0_supported: supported,
+        ..exit(EXIT_REASON_XSETBV)
+    }
+}
+
+#[test]
+fn xsetbv_of_a_value_xcr0_takes_is_emulated() {
+    for value in [0x1, 0x3, 0x7, 0xE7] {
+        assert_eq!(
+            xsetbv(&xsetbv_exit(0, value, 0xE7)),
+            ExitEvent::Emulated(Emulation::Xsetbv { value }),
+            "{value:#x}"
+        );
+    }
+    // Only ECX names the XCR, and only EDX:EAX the value.
+    let high_halves = ExitInfo {
+        guest_rcx: 0xFFFF_FFFF_0000_0000,
+        guest_rax: 0xFFFF_FFFF_0000_0003,
+        ..xsetbv_exit(0, 0, 0xE7)
+    };
+    assert_eq!(
+        xsetbv(&high_halves),
+        ExitEvent::Emulated(Emulation::Xsetbv { value: 0x3 })
+    );
+}
+
+#[test]
+fn xsetbv_gets_gp_for_every_rule_the_sdm_lists() {
+    // MPX and AMX supported too, to reach their rules.
+    let supported = 0x6_00FF;
+    for (xcr, value, why) in [
+        (1, 0x3, "not XCR0"),
+        (0, 0x1_0003, "outside the supported bits"),
+        (0, 0x2, "x87 clear"),
+        (0, 0x5, "AVX without SSE"),
+        (0, 0x67, "AVX-512 partly set"),
+        (0, 0xE3, "AVX-512 without AVX"),
+        (0, 0xB, "MPX partly set"),
+        (0, 0x2_0003, "AMX partly set"),
+    ] {
+        assert_eq!(
+            xsetbv(&xsetbv_exit(xcr, value, supported)),
+            ExitEvent::GuestGeneralProtection,
+            "{why}"
+        );
+    }
+    // The pairs set together are fine.
+    for value in [0x1B, 0x6_0003] {
+        assert!(xcr0_valid(value, supported), "{value:#x}");
+    }
+}
+
+#[test]
+fn without_xsetbv_in_root_operation_every_value_gets_gp() {
+    for value in [0x1, 0x3] {
+        assert_eq!(xsetbv(&xsetbv_exit(0, value, 0)), ExitEvent::GuestGeneralProtection);
+    }
 }
 
 const KERNEL_GS_BASE: u32 = 0xC000_0102;

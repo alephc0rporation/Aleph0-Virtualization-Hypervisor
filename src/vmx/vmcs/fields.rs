@@ -58,6 +58,17 @@ pub const SECONDARY_ENABLE_EPT: u32 = 1 << 1;
 /// virtual-processor identifier. Aleph0 does not enable it; the EPT/VPID
 /// capability MSR exists if either this or EPT is allowed.
 pub const SECONDARY_ENABLE_VPID: u32 = 1 << 5;
+/// Secondary control bit 3: RDTSCP and RDPID run in the guest; while 0 they
+/// raise #UD there.
+pub const SECONDARY_ENABLE_RDTSCP: u32 = 1 << 3;
+/// Secondary control bit 12: INVPCID runs in the guest; while 0 it raises #UD.
+pub const SECONDARY_ENABLE_INVPCID: u32 = 1 << 12;
+/// Secondary control bit 20: XSAVES and XRSTORS run in the guest, exiting
+/// only for the components [`XSS_EXIT_BITMAP`] names; while 0 they raise #UD.
+pub const SECONDARY_ENABLE_XSAVES: u32 = 1 << 20;
+/// Secondary control bit 26: TPAUSE, UMONITOR and UMWAIT run in the guest;
+/// while 0 they raise #UD.
+pub const SECONDARY_ENABLE_USER_WAIT_PAUSE: u32 = 1 << 26;
 /// Exception bitmap: bit N set makes guest exception vector N cause a VM exit
 /// (reason 0) instead of being delivered through the guest's IDT.
 pub const EXCEPTION_BITMAP: u32 = 0x4004;
@@ -107,6 +118,10 @@ pub const MSR_BITMAP: u32 = 0x2004;
 /// EPT pointer (EPTP): the physical address of the EPT PML4 table, with the
 /// memory type and page-walk length in its low bits (see `vmx::ept::Eptp`).
 pub const EPT_POINTER: u32 = 0x201A;
+/// XSS-exiting bitmap (64-bit): XSAVES and XRSTORS exit when a component they
+/// would touch has its bit set here and in IA32_XSS. Exists only when the CPU
+/// allows [`SECONDARY_ENABLE_XSAVES`].
+pub const XSS_EXIT_BITMAP: u32 = 0x202C;
 
 /// VM-exit control bit 9: the host runs in 64-bit mode after a VM exit.
 pub const VM_EXIT_HOST_ADDRESS_SPACE_SIZE: u32 = 1 << 9;

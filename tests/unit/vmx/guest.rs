@@ -7,8 +7,8 @@
 use super::*;
 
 #[test]
-fn guest_code_moves_an_mtrr_reads_the_local_apic_halts_writes_its_data_page_then_waits_for_an_nmi_between_two_vmcalls()
-{
+fn guest_code_sets_xcr0_moves_an_mtrr_reads_the_local_apic_halts_writes_its_data_page_then_waits_for_an_nmi_between_two_vmcalls()
+ {
     assert_eq!(
         guest_code(),
         [
@@ -16,7 +16,7 @@ fn guest_code_moves_an_mtrr_reads_the_local_apic_halts_writes_its_data_page_then
             0x31, 0xC9, // xor ecx, ecx
             0x0F, 0xA2, // cpuid
             0x0F, 0xBA, 0xE1, 0x05, // bt ecx, 5
-            0x0F, 0x82, 0x81, 0x01, 0x00, 0x00, // jc guest_emulation_failed (+385)
+            0x0F, 0x82, 0xDB, 0x01, 0x00, 0x00, // jc guest_emulation_failed (+475)
             0xB9, 0x02, 0x01, 0x00, 0xC0, // mov ecx, IA32_KERNEL_GS_BASE
             0x0F, 0x32, // rdmsr
             0x89, 0xC6, // mov esi, eax
@@ -28,9 +28,9 @@ fn guest_code_moves_an_mtrr_reads_the_local_apic_halts_writes_its_data_page_then
             0x31, 0xD2, // xor edx, edx
             0x0F, 0x32, // rdmsr
             0x83, 0xF8, 0x00, // cmp eax, GUEST_MSR_VALUE as u32
-            0x0F, 0x85, 0x5B, 0x01, 0x00, 0x00, // jne guest_emulation_failed (+347, too far for a rel8)
+            0x0F, 0x85, 0xB5, 0x01, 0x00, 0x00, // jne guest_emulation_failed (+437, too far for a rel8)
             0x81, 0xFA, 0x1E, 0x7A, 0x00, 0x00, // cmp edx, GUEST_MSR_VALUE >> 32
-            0x0F, 0x85, 0x4F, 0x01, 0x00, 0x00, // jne guest_emulation_failed (+335)
+            0x0F, 0x85, 0xA9, 0x01, 0x00, 0x00, // jne guest_emulation_failed (+425)
             0x89, 0xF0, // mov eax, esi
             0x89, 0xFA, // mov edx, edi
             0x0F, 0x30, // wrmsr
@@ -42,9 +42,36 @@ fn guest_code_moves_an_mtrr_reads_the_local_apic_halts_writes_its_data_page_then
             0x31, 0xC0, // xor eax, eax
             0xEC, // in al, dx
             0x3C, 0xA5, // cmp al, GUEST_IO_VALUE
-            0x0F, 0x85, 0x33, 0x01, 0x00, 0x00, // jne guest_emulation_failed (+307)
+            0x0F, 0x85, 0x8D, 0x01, 0x00, 0x00, // jne guest_emulation_failed (+397)
             0x40, 0x88, 0xF0, // mov al, sil
             0xEE, // out dx, al
+            0x0F, 0x20, 0xE0, // mov rax, cr4
+            0x48, 0x0F, 0xBA, 0xE8, 0x12, // bts rax, 18 (OSXSAVE)
+            0x0F, 0x22, 0xE0, // mov cr4, rax (no exit: the mask leaves OSXSAVE to the guest)
+            0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0x31, 0xC9, // xor ecx, ecx
+            0x0F, 0xA2, // cpuid
+            0x0F, 0xBA, 0xE1, 0x1B, // bt ecx, 27 (OSXSAVE)
+            0x0F, 0x83, 0x6B, 0x01, 0x00, 0x00, // jnc guest_emulation_failed (+363)
+            0x31, 0xC9, // xor ecx, ecx
+            0x0F, 0x01, 0xD0, // xgetbv
+            0x89, 0xC6, // mov esi, eax
+            0x89, 0xD7, // mov edi, edx
+            0xB8, 0x03, 0x00, 0x00, 0x00, // mov eax, GUEST_XCR0_VALUE
+            0x31, 0xD2, // xor edx, edx
+            0x0F, 0x01, 0xD1, // xsetbv
+            0x0F, 0x01, 0xD0, // xgetbv
+            0x83, 0xF8, 0x03, // cmp eax, GUEST_XCR0_VALUE
+            0x0F, 0x85, 0x4C, 0x01, 0x00, 0x00, // jne guest_emulation_failed (+332)
+            0x85, 0xD2, // test edx, edx
+            0x0F, 0x85, 0x44, 0x01, 0x00, 0x00, // jnz guest_emulation_failed (+324)
+            0x89, 0xF0, // mov eax, esi
+            0x89, 0xFA, // mov edx, edi
+            0x0F, 0x01, 0xD1, // xsetbv (XCR0 as it was)
+            0x0F, 0x20, 0xE0, // mov rax, cr4
+            0x48, 0x0F, 0xBA, 0xF0, 0x12, // btr rax, 18 (OSXSAVE)
+            0x0F, 0x22, 0xE0, // mov cr4, rax
+            0x0F, 0x01, 0xF9, // rdtscp
             0xB8, 0x08, 0x00, 0x00, 0x80, // mov eax, ADDRESS_SIZES
             0x0F, 0xA2, // cpuid
             0x89, 0xC1, // mov ecx, eax
@@ -119,7 +146,7 @@ fn guest_code_moves_an_mtrr_reads_the_local_apic_halts_writes_its_data_page_then
             0xF4, // hlt
             0x31, 0xDB, // xor ebx, ebx
             0x48, 0x8D, 0x3D, // lea rdi, [rip + guest_code_start]:
-            0xAC, 0xFE, 0xFF, 0xFF, //   -340, back to byte 0
+            0x52, 0xFE, 0xFF, 0xFF, //   -430, back to byte 0
             0x48, 0x81, 0xC7, // add rdi, 0x1000
             0x00, 0x10, 0x00, 0x00, 0x8B, 0x0F, // mov ecx, [rdi]
             0xC7, 0x07, // mov dword ptr [rdi], GUEST_EPT_VALUE
@@ -149,8 +176,8 @@ fn guest_code_moves_an_mtrr_reads_the_local_apic_halts_writes_its_data_page_then
 
 #[test]
 fn nmi_handler_starts_after_the_main_code() {
-    // Byte 387 in the listing above: right after the ud2.
-    assert_eq!(nmi_handler_offset(), 387);
+    // Byte 477 in the listing above: right after the ud2.
+    assert_eq!(nmi_handler_offset(), 477);
 }
 
 #[test]
