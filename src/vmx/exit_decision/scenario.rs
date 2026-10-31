@@ -1,8 +1,8 @@
 //! The test guest's own exits: its write to the EPT-protected data page,
 //! its main VMCALLs, NMI reinjection, and the reinjected NMI's delivery
 //! faulting on the EPT-protected stack page. `decide` sends only the test
-//! guest's VMCALLs and EPT violations here; NMI reinjection serves every
-//! guest, the firmware too.
+//! guest's VMCALLs and EPT violations here; NMI reinjection, with its NMI and
+//! interrupt windows, serves every guest, the firmware too.
 //!
 //! The guest (`guest.rs`) writes its read-only data page, makes two main
 //! VMCALLs, with `GUEST_MARKER` and then `GUEST_MARKER + 1` in RAX, and
@@ -15,9 +15,13 @@
 //! main VMCALL #1 ──▶ resume past it (only after the EPT violation, and only
 //!                    if ECX/EDX hold the data page's seed and new value)
 //! NMI exit       ──▶ guest can take the NMI:  inject it at the next entry
-//!                    guest cannot yet (STI, MOV SS or NMI blocking):
+//!                    guest cannot yet (MOV SS or NMI blocking):
 //!                                             turn on NMI-window exiting,
 //! NMI-window exit──▶                          inject when the window opens
+//!                    only an STI shadow holds it back (any guest; the test
+//!                    guest never runs STI):   turn on interrupt-window
+//! interrupt-window──▶                         exiting instead, inject once
+//!   exit                                      the shadow has ended
 //! EPT violation  ──▶ the injected NMI's delivery pushed the interrupt frame
 //!  (IDT-vectoring   onto the read-only stack page: make it writable and
 //!   = the NMI)      re-deliver the NMI (the handler, from IDT-vectoring)
@@ -68,6 +72,29 @@ pub fn expected_main_rax(state: ExitState) -> u64 {
     u64::from(GUEST_MARKER) + u64::from(state.main_vmcalls) + u64::from(cfg!(feature = "unexpected-exit-test"))
 }
 
+/// The deferral of an NMI the guest cannot take yet (`interruptibility`
+/// has a bit of [`NMI_INJECTION_BLOCKED`]), and `state` with it pending.
+///
+/// Blocking by STI alone waits for the interrupt window; any other blocking
+/// for the NMI window. A CPU may report an NMI-window exit inside an STI
+/// shadow, where no injection is allowed either, so waiting for the NMI window
+/// there could exit at the same instruction forever (`ResumePlan::
+/// WAIT_FOR_STI_SHADOW`).
+fn deferred(state: ExitState, interruptibility: u32) -> (ExitEvent, ExitState) {
+    let event = if interruptibility & NMI_INJECTION_BLOCKED == BLOCKING_BY_STI {
+        ExitEvent::NmiDeferredPastSti
+    } else {
+        ExitEvent::NmiDeferred
+    };
+    (
+        event,
+        ExitState {
+            nmi_pending: true,
+            ..state
+        },
+    )
+}
+
 /// `state` after an NMI is injected: nothing pending. Several NMIs never
 /// queue: a new NMI while one is pending replaces it, as on real hardware,
 /// where at most one NMI waits.
@@ -87,13 +114,7 @@ pub(super) fn exception_or_nmi(state: ExitState, exit: &ExitInfo) -> (ExitEvent,
     if exit.interruptibility & NMI_INJECTION_BLOCKED == 0 {
         (ExitEvent::NmiInjected, injected(state))
     } else {
-        (
-            ExitEvent::NmiDeferred,
-            ExitState {
-                nmi_pending: true,
-                ..state
-            },
-        )
+        deferred(state, exit.interruptibility)
     }
 }
 
@@ -104,12 +125,30 @@ pub(super) fn nmi_window(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitS
     }
     // Per the SDM, NMI-window exits never occur under MOV SS blocking, but
     // the processor may still report one under STI blocking. Injecting then
-    // would fail the VM entry, so keep waiting. (MOV SS stays in the mask;
-    // it is harmless.)
+    // would fail the VM entry, so wait: for the interrupt window when STI is
+    // the only blocker, which ends the loop such a CPU would otherwise run.
+    // (MOV SS stays in the mask; it is harmless.)
     if exit.interruptibility & NMI_INJECTION_BLOCKED != 0 {
-        (ExitEvent::NmiDeferred, state)
+        deferred(state, exit.interruptibility)
     } else {
         (ExitEvent::NmiWindowInjected, injected(state))
+    }
+}
+
+/// Interrupt window (exit reason 7): the STI shadow that held back the
+/// pending NMI has ended, so inject it. Aleph0 turns interrupt-window exiting
+/// on only for that (`ResumePlan::WAIT_FOR_STI_SHADOW`), so without a pending
+/// NMI the exit is unexpected. The window opens with no STI or MOV SS
+/// blocking; blocking by NMI is still checked, as at the NMI window, and
+/// waits for the NMI window if set.
+pub(super) fn interrupt_window(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
+    if !state.nmi_pending {
+        return (ExitEvent::Unexpected, state);
+    }
+    if exit.interruptibility & NMI_INJECTION_BLOCKED != 0 {
+        deferred(state, exit.interruptibility)
+    } else {
+        (ExitEvent::InterruptWindowInjected, injected(state))
     }
 }
 

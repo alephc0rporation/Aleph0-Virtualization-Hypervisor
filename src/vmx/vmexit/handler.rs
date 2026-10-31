@@ -34,8 +34,8 @@ use crate::vmx::ept::{self, InveptType, ProtectedPage};
 use crate::vmx::exit_decision::{
     CrNumber, CrQualification, EXIT_REASON_CONTROL_REGISTER, EXIT_REASON_EPT_MISCONFIG, EXIT_REASON_EPT_VIOLATION,
     EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_VMCALL, Emulation, ExitAction, ExitEvent, ExitInfo, ExitReason, ExitState,
-    InterruptionInfo, IoSize, Redelivery, ResumePlan, UNREADABLE_REASON, after_nmi_redelivery,
-    after_skipped_instruction, cpl_from_ss, cpuid_policy, decide, is_canonical_48, merge_in,
+    InterruptionInfo, IoSize, Redelivery, ResumePlan, UNREADABLE_REASON, cpl_from_ss, cpuid_policy, decide,
+    is_canonical_48, merge_in,
 };
 use crate::vmx::host;
 use crate::vmx::hyperv::{self, HypercallRegisters};
@@ -503,6 +503,12 @@ fn carry_out(event: ExitEvent, read: &ExitRead, next: ExitState, frame: &mut Reg
     match event.action() {
         ExitAction::Resume(plan) => {
             let plan = plan.keeping_pending_nmi(next);
+            // A fault in an IRET that had ended NMI blocking: resume with the
+            // blocking set again. `exit` is always read for a resumed exit.
+            let plan = match read.exit {
+                Some(exit) => plan.restoring_nmi_blocking(&exit),
+                None => plan,
+            };
             // Re-deliver an event this exit interrupted mid-delivery. The plan
             // refuses when it would also advance RIP or inject its own event,
             // since only one event is injected per VM entry.
@@ -868,12 +874,14 @@ fn write_for_resume(field: u32, value: u64, what: &'static str) -> Result<(), Re
 }
 
 /// Prepares the VMCS (and EPT) as `plan` says: executes the emulated
-/// instruction into `frame`, moves GUEST_RIP past the exiting instruction
-/// and ends an STI or MOV SS shadow, queues an NMI or an exception for
-/// injection at the next VM entry, turns NMI-window exiting on or off, and
-/// makes the protected page writable. Returns the plan carried out, which
-/// injects an exception instead of advancing RIP when Hyper-V refused a
-/// forwarded access, and how the guest resumes; or why it cannot.
+/// instruction into `frame`, moves GUEST_RIP past the exiting instruction,
+/// updates the guest's interruptibility state (an STI or MOV SS shadow ended,
+/// blocking by NMI cleared or set again), queues an NMI, an exception or a
+/// re-delivered event for injection at the next VM entry, turns NMI-window
+/// and interrupt-window exiting on or off, and makes the protected page
+/// writable. Returns the plan carried out, which injects an exception instead
+/// of advancing RIP when Hyper-V refused a forwarded access, and how the guest
+/// resumes; or why it cannot.
 fn prepare_resume(
     read: &ExitRead,
     plan: ResumePlan,
@@ -901,27 +909,15 @@ fn prepare_resume(
     let ResumePlan {
         inject_nmi,
         nmi_window,
+        interrupt_window,
         grant_write,
         inject_exception,
         redeliver,
-        clear_nmi_blocking,
         ..
     } = plan;
 
     let resume_rip = if let Some(next) = advance_to {
         write_for_resume(GUEST_RIP, next, "advance guest RIP")?;
-        // `exit` is always read here: `decide` only plans a resume for an
-        // exit it could judge. Written only when a shadow was set, so most
-        // exits pay nothing.
-        let interruptibility = read.exit.map_or(0, |exit| exit.interruptibility);
-        let cleared = after_skipped_instruction(interruptibility);
-        if cleared != interruptibility {
-            write_for_resume(
-                GUEST_INTERRUPTIBILITY_STATE,
-                cleared.into(),
-                "end the guest's STI/MOV SS blocking",
-            )?;
-        }
         next
     } else {
         // An NMI exit: the guest goes on at the instruction it was about to
@@ -931,20 +927,19 @@ fn prepare_resume(
         rip
     };
 
-    if clear_nmi_blocking {
-        // Re-delivering an NMI whose delivery faulted: clear blocking by NMI
-        // so VM entry can inject it. `exit` is always read for a resumed exit,
-        // and this plan never also advances RIP (`ResumePlan::redelivering`),
-        // so it does not race the STI/MOV SS clearing above.
-        let interruptibility = read.exit.map_or(0, |exit| exit.interruptibility);
-        let cleared = after_nmi_redelivery(interruptibility);
-        if cleared != interruptibility {
-            write_for_resume(
-                GUEST_INTERRUPTIBILITY_STATE,
-                cleared.into(),
-                "end the guest's NMI blocking for re-delivery",
-            )?;
-        }
+    // Ends an STI or MOV SS shadow when RIP moved, clears blocking by NMI for
+    // an NMI re-delivery, or sets it again after a fault in an NMI-unblocking
+    // IRET (`ResumePlan::interruptibility`). `exit` is always read here:
+    // `decide` only plans a resume for an exit it could judge. Written only
+    // when something changes, so most exits pay nothing.
+    let found = read.exit.map_or(0, |exit| exit.interruptibility);
+    let interruptibility = plan.interruptibility(found);
+    if interruptibility != found {
+        write_for_resume(
+            GUEST_INTERRUPTIBILITY_STATE,
+            interruptibility.into(),
+            "update the guest's interruptibility state",
+        )?;
     }
     if inject_nmi {
         write_for_resume(
@@ -978,6 +973,19 @@ fn prepare_resume(
                 "turn NMI-window exiting on"
             } else {
                 "turn NMI-window exiting off"
+            },
+            error,
+        })?;
+    }
+    if let Some(on) = interrupt_window {
+        // SAFETY: exit context: VMX root operation, with the guest's VMCS
+        // current. `configure_controls` checked that the CPU allows
+        // interrupt-window exiting.
+        unsafe { vmcs::set_interrupt_window_exiting(on) }.map_err(|error| ResumeFailure::Write {
+            what: if on {
+                "turn interrupt-window exiting on"
+            } else {
+                "turn interrupt-window exiting off"
             },
             error,
         })?;

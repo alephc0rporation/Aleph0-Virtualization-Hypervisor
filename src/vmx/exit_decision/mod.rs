@@ -20,9 +20,9 @@
 //!   get #UD, need no handler of their own.
 //! - `scenario.rs`: exits that depend on what came before:
 //!   `fn(ExitState, &ExitInfo) -> (ExitEvent, ExitState)`. NMI reinjection,
-//!   for every guest, and the test guest's own exits: its EPT write and its
-//!   VMCALLs. Any other EPT violation stops the guest as
-//!   [`ExitEvent::EptViolation`].
+//!   with its NMI and interrupt windows, for every guest, and the test
+//!   guest's own exits: its EPT write and its VMCALLs. Any other EPT
+//!   violation stops the guest as [`ExitEvent::EptViolation`].
 //! - An EPT misconfiguration stops the guest as
 //!   [`ExitEvent::EptMisconfig`]. Aleph0 makes no misconfigured entry on
 //!   purpose (KVM does, for MMIO, and emulates the access in
@@ -106,6 +106,11 @@ pub const UNREADABLE_REASON: u16 = 0xFFFF;
 
 /// Basic exit reason of an exception or NMI exit.
 pub const EXIT_REASON_EXCEPTION_OR_NMI: u16 = 0;
+/// Basic exit reason of an interrupt-window exit: the guest can take an
+/// external interrupt (RFLAGS.IF = 1, no STI or MOV SS blocking). Aleph0 turns
+/// interrupt-window exiting on only to wait out an STI shadow that holds back
+/// a pending NMI.
+pub const EXIT_REASON_INTERRUPT_WINDOW: u16 = 7;
 /// Basic exit reason of an NMI-window exit.
 pub const EXIT_REASON_NMI_WINDOW: u16 = 8;
 /// Basic exit reason of CPUID, which always exits.
@@ -156,9 +161,10 @@ pub const EPT_LINEAR_VALID: u64 = 1 << 7;
 /// Bit 8 (with bit 7): the access was to the linear address the guest
 /// used, not to one of the guest's own page tables during the walk.
 pub const EPT_TRANSLATED_ACCESS: u64 = 1 << 8;
-/// Bit 12: the violation happened during an IRET that ended NMI blocking.
-/// Resuming would then need NMI blocking set again by hand, which Aleph0
-/// does not do, so such a violation is never handled.
+/// Bit 12: the violation happened during an IRET that ended NMI blocking
+/// (undefined when IDT_VECTORING_INFO is valid). The IRET had already
+/// unblocked NMIs when it faulted, so resuming at it needs blocking by NMI set
+/// again by hand ([`ExitInfo::faulted_nmi_unblocking_iret`]).
 pub const EPT_NMI_UNBLOCKING_IRET: u64 = 1 << 12;
 
 /// An EPT violation's exit qualification (EXIT_QUALIFICATION), decoded with
@@ -202,11 +208,12 @@ impl EptQualification {
     }
 
     /// The EPT violation Aleph0 handles: a write to a page EPT maps readable
-    /// but not writable, through the linear address the guest used.
+    /// but not writable, through the linear address the guest used. One
+    /// during an IRET that ended NMI blocking (bit 12) counts too; the resume
+    /// sets the blocking again ([`ResumePlan::restoring_nmi_blocking`]).
     pub fn is_protected_write(self) -> bool {
         let required = EPT_ACCESS_WRITE | EPT_PAGE_READABLE | EPT_LINEAR_VALID | EPT_TRANSLATED_ACCESS;
-        let refused = EPT_PAGE_WRITABLE | EPT_NMI_UNBLOCKING_IRET;
-        self.0 & required == required && self.0 & refused == 0
+        self.0 & required == required && self.0 & EPT_PAGE_WRITABLE == 0
     }
 }
 
@@ -235,6 +242,11 @@ impl InterruptionInfo {
     const TYPE_HARDWARE_EXCEPTION: u32 = 3;
     /// Bit 11: deliver an error code (VM_ENTRY_EXCEPTION_ERROR_CODE).
     const DELIVER_ERROR_CODE: u32 = 1 << 11;
+    /// Bit 12, in VM_EXIT_INTERRUPTION_INFO only: the exception was a fault
+    /// in an IRET that ended NMI blocking.
+    const NMI_UNBLOCKING_IRET: u32 = 1 << 12;
+    /// IDT vector of #DF, for which bit 12 is undefined.
+    const DF_VECTOR: u8 = 8;
     /// IDT vector of #UD.
     const UD_VECTOR: u32 = 6;
     /// IDT vector of #GP.
@@ -277,6 +289,17 @@ impl InterruptionInfo {
         self.is_valid()
             && self.vector() == Some(NMI_VECTOR)
             && matches!(self.event_type(), Self::TYPE_NMI | Self::TYPE_HARDWARE_EXCEPTION)
+    }
+
+    /// Whether this field, read as VM_EXIT_INTERRUPTION_INFO, reports a
+    /// hardware exception raised by an IRET that had ended NMI blocking (bit
+    /// 12). The SDM leaves bit 12 undefined for a double fault, so #DF never
+    /// counts.
+    pub fn is_nmi_unblocking_iret_fault(self) -> bool {
+        self.is_valid()
+            && self.event_type() == Self::TYPE_HARDWARE_EXCEPTION
+            && self.vector() != Some(Self::DF_VECTOR)
+            && self.0 & Self::NMI_UNBLOCKING_IRET != 0
     }
 
     /// Whether VM entry also delivers VM_ENTRY_EXCEPTION_ERROR_CODE (bit 11).
@@ -418,6 +441,26 @@ impl ExitInfo {
             instruction_len: info.needs_instruction_len().then_some(instruction_len).flatten(),
         })
     }
+
+    /// Whether the exit came from a fault in an IRET that had already ended
+    /// NMI blocking: bit 12 of an EPT violation's qualification, or of an
+    /// exception exit's VM_EXIT_INTERRUPTION_INFO (Intel SDM Vol. 3C, "Exit
+    /// Qualification for EPT Violations" and "Information for VM Exits Due to
+    /// Vectored Events"). With virtual NMIs the CPU leaves the guest unblocked
+    /// then, and resuming at the IRET would let an NMI in before the handler's
+    /// IRET has run: the resume must set blocking by NMI again. Bit 12 is
+    /// undefined when the exit interrupted an event's delivery, so such an
+    /// exit never counts.
+    pub fn faulted_nmi_unblocking_iret(&self) -> bool {
+        if self.reason.entry_failure || self.idt_vectoring.is_valid() {
+            return false;
+        }
+        match self.reason.basic {
+            EXIT_REASON_EPT_VIOLATION => self.qualification & EPT_NMI_UNBLOCKING_IRET != 0,
+            EXIT_REASON_EXCEPTION_OR_NMI => self.interruption_info.is_nmi_unblocking_iret_fault(),
+            _ => false,
+        }
+    }
 }
 
 /// What the handler remembers between exits: the NMI waiting for the guest,
@@ -466,11 +509,19 @@ pub enum ExitEvent {
     GuestNmiHandler,
     /// An NMI the guest can take now: inject it.
     NmiInjected,
-    /// An NMI while the guest cannot take an NMI yet (STI, MOV SS or NMI
-    /// blocking): wait for the NMI window.
+    /// An NMI while the guest cannot take an NMI yet (MOV SS or NMI
+    /// blocking, with or without STI blocking): wait for the NMI window.
     NmiDeferred,
+    /// An NMI held back by blocking by STI alone: wait for the interrupt
+    /// window, which opens once the STI shadow ends. A CPU may report an
+    /// NMI-window exit inside the shadow, so the NMI window could not wait it
+    /// out ([`ResumePlan::WAIT_FOR_STI_SHADOW`]).
+    NmiDeferredPastSti,
     /// The NMI window opened: inject the pending NMI.
     NmiWindowInjected,
+    /// The interrupt window opened, so the STI shadow has ended: inject the
+    /// pending NMI.
+    InterruptWindowInjected,
     /// The guest wrote its protected data page: grant write and retry the
     /// write.
     EptWriteGranted,
@@ -535,6 +586,10 @@ pub struct ResumePlan {
     /// Turn NMI-window exiting on (`Some(true)`) or off (`Some(false)`), or
     /// leave it (`None`).
     pub nmi_window: Option<bool>,
+    /// Turn interrupt-window exiting on (`Some(true)`) or off
+    /// (`Some(false)`), or leave it (`None`). Only on while an STI shadow
+    /// holds back a pending NMI.
+    pub interrupt_window: Option<bool>,
     /// Make the protected page writable in EPT
     /// (`ept::ProtectedPage::grant_write`).
     pub grant_write: bool,
@@ -554,77 +609,84 @@ pub struct ResumePlan {
     /// that faulted delivery left bit 3 set, and VM entry refuses to inject
     /// an NMI while it is ([`ResumePlan::redelivering`]).
     pub clear_nmi_blocking: bool,
+    /// Set blocking by NMI (bit 3) in GUEST_INTERRUPTIBILITY_STATE before
+    /// resuming. Set only after a fault in an IRET that had ended NMI
+    /// blocking ([`ResumePlan::restoring_nmi_blocking`]); never together with
+    /// `clear_nmi_blocking`, which needs a valid IDT-vectoring field, where
+    /// bit 12 is undefined.
+    pub restore_nmi_blocking: bool,
     /// Write a guest CR0/CR4 value and its read shadow before resuming, for a
     /// MOV to CR0/CR4 Aleph0 emulates ([`ExitEvent::ControlRegisterWrite`]).
     pub write_cr: Option<CrWrite>,
 }
 
 impl ResumePlan {
+    /// Go on where the guest was, with nothing changed: the base the plans
+    /// below change.
+    const AS_IS: Self = Self {
+        advance_rip: false,
+        inject_nmi: false,
+        nmi_window: None,
+        interrupt_window: None,
+        grant_write: false,
+        emulate: None,
+        inject_exception: None,
+        redeliver: None,
+        clear_nmi_blocking: false,
+        restore_nmi_blocking: false,
+        write_cr: None,
+    };
     /// Go on after the exiting instruction (a VMCALL).
     pub const PAST_INSTRUCTION: Self = Self {
         advance_rip: true,
-        inject_nmi: false,
-        nmi_window: None,
-        grant_write: false,
-        emulate: None,
-        inject_exception: None,
-        redeliver: None,
-        clear_nmi_blocking: false,
-        write_cr: None,
+        ..Self::AS_IS
     };
     /// Inject an NMI, delivered before the instruction the guest was about
-    /// to run. Injecting always turns NMI-window exiting off: it may have
-    /// been on for an earlier NMI the new one replaces, and turning it off
-    /// when it was already off is harmless.
+    /// to run. Injecting always turns NMI-window and interrupt-window exiting
+    /// off: either may have been on for the NMI now injected, and turning one
+    /// off when it was already off is harmless.
     pub const INJECT_NMI: Self = Self {
-        advance_rip: false,
         inject_nmi: true,
         nmi_window: Some(false),
-        grant_write: false,
-        emulate: None,
-        inject_exception: None,
-        redeliver: None,
-        clear_nmi_blocking: false,
-        write_cr: None,
+        interrupt_window: Some(false),
+        ..Self::AS_IS
     };
     /// Go on where the guest was, with NMI-window exiting on, so the next
-    /// exit comes as soon as the guest can take an NMI.
+    /// exit comes as soon as the guest can take an NMI. Interrupt-window
+    /// exiting goes off: an interrupt-window exit with NMI blocking still set
+    /// ends up here, and the NMI window alone waits for that blocking's IRET.
     pub const WAIT_FOR_NMI_WINDOW: Self = Self {
-        advance_rip: false,
-        inject_nmi: false,
         nmi_window: Some(true),
-        grant_write: false,
-        emulate: None,
-        inject_exception: None,
-        redeliver: None,
-        clear_nmi_blocking: false,
-        write_cr: None,
+        interrupt_window: Some(false),
+        ..Self::AS_IS
+    };
+    /// Go on where the guest was, with interrupt-window exiting on and
+    /// NMI-window exiting off, while blocking by STI alone holds a pending NMI
+    /// back. A CPU may report an NMI-window exit inside an STI shadow (Intel
+    /// SDM Vol. 3C, "NMI-Window Exiting"), and the NMI could not be injected
+    /// there either, so with the NMI window on such a CPU would exit again at
+    /// the same instruction forever. The interrupt window opens only once the
+    /// shadow has ended, and blocking by STI implies RFLAGS.IF = 1, so it
+    /// opens right after the guest's next instruction, unless that
+    /// instruction is CLI: then the NMI waits for the guest's next exit,
+    /// which turns the NMI window back on ([`ResumePlan::keeping_pending_nmi`]).
+    /// KVM does the same (`vmx_enable_nmi_window`).
+    pub const WAIT_FOR_STI_SHADOW: Self = Self {
+        nmi_window: Some(false),
+        interrupt_window: Some(true),
+        ..Self::AS_IS
     };
     /// Make the protected page writable; RIP stays on the faulting write, so
     /// it runs again.
     pub const RETRY_AFTER_GRANT: Self = Self {
-        advance_rip: false,
-        inject_nmi: false,
-        nmi_window: None,
         grant_write: true,
-        emulate: None,
-        inject_exception: None,
-        redeliver: None,
-        clear_nmi_blocking: false,
-        write_cr: None,
+        ..Self::AS_IS
     };
     /// Inject #GP(0); RIP stays on the faulting instruction, as for any
     /// fault.
     pub const INJECT_GP: Self = Self {
-        advance_rip: false,
-        inject_nmi: false,
-        nmi_window: None,
-        grant_write: false,
-        emulate: None,
         inject_exception: Some(InterruptionInfo::GENERAL_PROTECTION),
-        redeliver: None,
-        clear_nmi_blocking: false,
-        write_cr: None,
+        ..Self::AS_IS
     };
     /// Inject #UD; RIP stays on the faulting instruction.
     pub const INJECT_UD: Self = Self {
@@ -638,9 +700,12 @@ impl ResumePlan {
     /// pending after the exit (`next`). Without that, an NMI folded in by
     /// [`ExitState::with_host_nmi`] at an exit that does not handle NMIs
     /// would wait until some unrelated exit came along. Plans that inject an
-    /// NMI leave nothing pending, so they keep turning the window off.
+    /// NMI leave nothing pending, so they keep turning the window off. A plan
+    /// that waits out an STI shadow ([`ResumePlan::WAIT_FOR_STI_SHADOW`])
+    /// keeps the NMI window off: inside the shadow it could exit at the same
+    /// instruction forever.
     pub fn keeping_pending_nmi(self, next: ExitState) -> Self {
-        if next.nmi_pending {
+        if next.nmi_pending && self.interrupt_window != Some(true) {
             Self {
                 nmi_window: Some(true),
                 ..self
@@ -660,6 +725,39 @@ impl ResumePlan {
             inject_exception: Some(exception),
             ..self
         }
+    }
+
+    /// This plan, setting blocking by NMI again when `exit` was a fault in an
+    /// IRET that had ended it ([`ExitInfo::faulted_nmi_unblocking_iret`]).
+    /// The guest then resumes at the IRET (the faulting access runs again, or
+    /// the fault is delivered there) with NMIs blocked, as they were before
+    /// the IRET ran; its next IRET ends the blocking. KVM does the same
+    /// (`vmx_recover_nmi_blocking`, `handle_ept_violation`).
+    pub fn restoring_nmi_blocking(self, exit: &ExitInfo) -> Self {
+        Self {
+            restore_nmi_blocking: exit.faulted_nmi_unblocking_iret(),
+            ..self
+        }
+    }
+
+    /// GUEST_INTERRUPTIBILITY_STATE to resume with, from the one the exit
+    /// found (`found`): blocking by STI and by MOV SS ended when RIP moves past
+    /// the instruction ([`after_skipped_instruction`]), blocking by NMI
+    /// cleared for an NMI re-delivery ([`after_nmi_redelivery`]) or set again
+    /// after a fault in an NMI-unblocking IRET. The handler writes the field
+    /// only when this differs from `found`.
+    pub fn interruptibility(self, found: u32) -> u32 {
+        let mut state = found;
+        if self.advance_rip {
+            state = after_skipped_instruction(state);
+        }
+        if self.clear_nmi_blocking {
+            state = after_nmi_redelivery(state);
+        }
+        if self.restore_nmi_blocking {
+            state |= scenario::BLOCKING_BY_NMI;
+        }
+        state
     }
 
     /// This plan with `redelivery` added, or `None` when it cannot be added
@@ -726,8 +824,11 @@ impl ExitEvent {
     pub fn action(self) -> ExitAction {
         match self {
             Self::MainVmcall | Self::GuestNmiHandler => ExitAction::Resume(ResumePlan::PAST_INSTRUCTION),
-            Self::NmiInjected | Self::NmiWindowInjected => ExitAction::Resume(ResumePlan::INJECT_NMI),
+            Self::NmiInjected | Self::NmiWindowInjected | Self::InterruptWindowInjected => {
+                ExitAction::Resume(ResumePlan::INJECT_NMI)
+            }
             Self::NmiDeferred => ExitAction::Resume(ResumePlan::WAIT_FOR_NMI_WINDOW),
+            Self::NmiDeferredPastSti => ExitAction::Resume(ResumePlan::WAIT_FOR_STI_SHADOW),
             Self::EptWriteGranted => ExitAction::Resume(ResumePlan::RETRY_AFTER_GRANT),
             Self::Emulated(emulation) => ExitAction::Resume(ResumePlan {
                 emulate: Some(emulation),
@@ -777,6 +878,7 @@ pub fn decide(guest: GuestKind, state: ExitState, exit: ExitInfo) -> (ExitEvent,
         EXIT_REASON_MWAIT | EXIT_REASON_MONITOR => (ExitEvent::GuestInvalidOpcode, state),
         EXIT_REASON_EXCEPTION_OR_NMI => scenario::exception_or_nmi(state, &exit),
         EXIT_REASON_NMI_WINDOW => scenario::nmi_window(state, &exit),
+        EXIT_REASON_INTERRUPT_WINDOW => scenario::interrupt_window(state, &exit),
         EXIT_REASON_EPT_VIOLATION if test_guest => scenario::ept_violation(state, &exit),
         EXIT_REASON_EPT_VIOLATION => (ExitEvent::EptViolation, state),
         EXIT_REASON_EPT_MISCONFIG => (ExitEvent::EptMisconfig, state),

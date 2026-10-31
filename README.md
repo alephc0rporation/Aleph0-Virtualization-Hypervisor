@@ -35,7 +35,8 @@ Verified on Hyper-V with nested virtualization:
       hypercalls and synthetic MSRs to Hyper-V from root operation, and
       gives it the #UD or #GP Hyper-V refuses one with
 - [x] Catches an NMI that arrives while the guest runs and reinjects it into
-      the guest's own IDT
+      the guest's own IDT, waiting out an STI shadow, and re-delivers an event
+      whose delivery exited
 - [x] Reports every exit over serial, then leaves VMX operation and returns to
       firmware
 - [x] Virtualizes the running firmware in place: on Hyper-V it runs as the
@@ -195,7 +196,7 @@ diagnostics that run before VMXON.
 | `src/vmx/guest_state.rs` | Guest-state VMCS fields, copied from the host CPU, and where each guest starts |
 | `src/vmx/vmcs/mod.rs`, `fields.rs`, `launch.rs` | VMCS lifecycle, field access, controls and host state; every field encoding; the launch stub that returns when the test guest stops, and the in-place launch the firmware goes on from as the guest |
 | `src/vmx/vmexit/` | VM-exit stack and entry stub with the VMRESUME path (`mod.rs`); the exit handler, as read, judge, carry out and report (`handler.rs`); the guest's copy of its MTRRs (`guest_mtrrs.rs`); its report lines (`report.rs`), how much of each exit they print (`policy.rs`), and what every stop adds: the guest's state and registers (`dump.rs`) and the last 64 exits (`history.rs`) |
-| `src/vmx/exit_decision/` | The pure decision for each exit: shared exit types and the dispatch on the exit reason (`mod.rs`), and one handler per reason; the instructions Aleph0 executes for any guest (CPUID, RDMSR/WRMSR, IN/OUT) and the routing of the guest's MTRR MSRs to its copy and of Hyper-V's synthetic MSRs to Hyper-V are in `emulation.rs`, the test guest's own exits (EPT write, VMCALLs, NMI reinjection) in `scenario.rs` |
+| `src/vmx/exit_decision/` | The pure decision for each exit: shared exit types and the dispatch on the exit reason (`mod.rs`), and one handler per reason; the instructions Aleph0 executes for any guest (CPUID, RDMSR/WRMSR, IN/OUT) and the routing of the guest's MTRR MSRs to its copy and of Hyper-V's synthetic MSRs to Hyper-V are in `emulation.rs`, the test guest's own exits (EPT write, VMCALLs, NMI reinjection with its NMI and interrupt windows) in `scenario.rs` |
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `tools/ebs-harness/` | The ExitBootServices test harness, an EFI application of its own (see [docs/RESIDENT.md](docs/RESIDENT.md)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |

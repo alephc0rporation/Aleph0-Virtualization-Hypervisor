@@ -93,6 +93,16 @@ fn nmi_window_off_clears_only_bit_22() {
 }
 
 #[test]
+fn interrupt_window_on_sets_only_bit_2() {
+    assert_eq!(with_interrupt_window_exiting(0x8441_E172, true), 0x8441_E176);
+}
+
+#[test]
+fn interrupt_window_off_clears_only_bit_2() {
+    assert_eq!(with_interrupt_window_exiting(0x8441_E176, false), 0x8441_E172);
+}
+
+#[test]
 fn the_guest_requests_hlt_exiting_and_the_msr_and_io_bitmaps() {
     let desired = DesiredControls::minimal_64_bit_guest(GuestKind::BuiltInTest);
     assert_eq!(desired.primary, (1 << 7) | (1 << 25) | (1 << 28));
