@@ -623,7 +623,7 @@ section 10, EPT split views).
   an MTRR write gives part of it another type.
 - **The guest's MAXPHYADDR**: CPUID passes it through. On a CPU that reports
   more than 48 bits, the guest could use GPAs a 4-level walk does not
-  translate; KVM caps the guest's physical-address width for that (#25).
+  translate; KVM caps the guest's physical-address width for that (#55).
 - **VPID**: tags TLB entries per guest so VM entries and exits need not
   flush them. A performance feature, independent of EPT.
 - **INVEPT before VMXOFF**: the EPT pages are never freed, so cached

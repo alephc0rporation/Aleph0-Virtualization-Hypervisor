@@ -68,7 +68,7 @@ in the `_` arm, which is `Unexpected` and stops the guest.
 
 The handlers live in two files:
 - `emulation.rs`: instructions Aleph0 executes for **any** guest (CPUID,
-  RDMSR, WRMSR, IN, OUT). It stays when an OS guest comes.
+  XSETBV, RDMSR, WRMSR, IN, OUT). It stays when an OS guest comes.
 - `scenario.rs`: the test guest's own exits (its write to the protected data
   page, its VMCALLs, NMI reinjection). It goes when an OS guest comes.
 
@@ -957,4 +957,4 @@ guest`, which arms the `-InjectNmi` job after main VMCALL #1.
 | Exception bitmap | all ones for the test guest, 0 for the firmware |
 | `GUEST_MSR_VALUE` / `GUEST_IO_VALUE` | `0x0000_7A1E_0000_0000` / `0xA5` |
 | `GUEST_EMULATION_FAIL_MARKER` | `0xFA11` in EAX at the `ud2` |
-| `guest::expected_stats` | cpuid 2, MSR reads 2, MSR writes 2, MTRR reads 3, MTRR writes 7, in 2, out 2, halt 1, exceptions 0 |
+| `guest::expected_stats` | cpuid 3, xsetbv 2, MSR reads 2, MSR writes 2, MTRR reads 3, MTRR writes 7, in 2, out 2, halt 1, exceptions 0 |
