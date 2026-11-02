@@ -1,12 +1,12 @@
-# Aleph0 Virtualization Hypervisor <img src="docs/mascot.gif" alt="Aleph0 mascot: a vampire cat rising from a coffin" width="80" align="right">
+# VMpire <img src="docs/mascot.gif" alt="VMpire mascot: a vampire cat rising from a coffin" width="80" align="right">
 
 [![CI](https://github.com/alephc0rporation/Aleph0-Virtualization-Hypervisor/actions/workflows/ci.yml/badge.svg)](https://github.com/alephc0rporation/Aleph0-Virtualization-Hypervisor/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](rust-toolchain.toml)
 [![Target: x86_64-unknown-uefi](https://img.shields.io/badge/target-x86__64--unknown--uefi-informational.svg)](.cargo/config.toml)
 
-An Intel VT-x hypervisor written in Rust and booted as a UEFI application.
-Aleph0 is being built to stay resident after `ExitBootServices` and run an
+VMpire, the Aleph0 Virtualization Hypervisor, is an Intel VT-x hypervisor
+written in Rust and booted as a UEFI application. Aleph0 is being built to stay resident after `ExitBootServices` and run an
 operating system as its guest, with EPT memory isolation and multiple vCPUs.
 The end goal is research into game anti-cheat: running below the guest OS,
 the hypervisor can watch and protect a game's memory where kernel-mode cheats
