@@ -8,11 +8,13 @@
 //!    refuses an unusable guest TR. The firmware's GDTR is recorded first,
 //!    and put back on every return path once this step has succeeded: by
 //!    `run` if a failure comes before VMXON, by step 7 after it.
-//! 2. Allocate the VM-exit stack and the guest's pages, and check how the
-//!    page tables map the guest pages.
+//! 2. Allocate the VM-exit stack and, for the test guest only, its pages,
+//!    and check how the page tables map them. The firmware, launched in
+//!    place, runs from its own memory and gets none.
 //! 3. Detect VMX, read its capability MSRs and check EPT support
 //!    ([`check_vmx_support`]), read the MTRRs, then build the EPT identity
-//!    map with their memory types and the guest's data page read-only, with
+//!    map with their memory types and the test guest's data and stack pages
+//!    read-only, with
 //!    spare PTs for the guest's MTRR writes. Allocate the MSR and I/O
 //!    bitmaps, which intercept every MTRR MSR, and give the exit handler the
 //!    guest's copy of the MTRRs. Build what Aleph0 runs on after a VM exit
@@ -237,7 +239,17 @@ pub fn run() -> Result<GuestRun, BringUpError> {
         // tables), then launch.
         Ok(_) => finalize_memory(mtrrs, types, &context_tables)
             .and_then(|()| write_cr_shadowing(&cr_controls))
-            .and_then(|()| launch_guest(&controls, &vmexit_stack, &guest, &ept, &host, &bitmaps, &context_tables)),
+            .and_then(|()| {
+                launch_guest(
+                    &controls,
+                    &vmexit_stack,
+                    guest.as_ref(),
+                    &ept,
+                    &host,
+                    &bitmaps,
+                    &context_tables,
+                )
+            }),
         Err(error) => Err(*error),
     };
     // This already runs as the guest: the firmware gets the CPU back
@@ -262,7 +274,8 @@ pub fn run() -> Result<GuestRun, BringUpError> {
 /// What exists once VMXON has succeeded, for the rest of [`run`].
 struct VmxEntry {
     vmexit_stack: VmExitStack,
-    guest: GuestMemory,
+    /// The test guest's pages; `None` for the firmware, launched in place.
+    guest: Option<GuestMemory>,
     ept: Ept,
     host: HostEnvironment,
     bitmaps: ExitBitmaps,
@@ -290,27 +303,13 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
         vmexit_stack.top()
     );
 
-    // shortcut: the firmware guest gets the test guest's pages too, to give
-    // `Ept::build` a page to protect; they are resident, and `finalize_memory`
-    // now hides them from the guest (code read-only, data to the shadow) like
-    // the rest of Aleph0, so no OS reaches them. Drop them once `Ept::build`
-    // no longer needs a protected page of its own.
-    let guest = GuestMemory::allocate()?;
-    log!(
-        "Guest memory allocated: code={:#018x} ({} bytes copied) stack top={:#018x}.",
-        guest.code_base(),
-        guest.code_len(),
-        guest.stack_top(),
-    );
-    log!(
-        "Guest IDT at {:#018x} (limit {:#06x}): vector 2 -> NMI handler at {:#018x}.",
-        guest.idt().base,
-        guest.idt().limit,
-        guest.nmi_handler(),
-    );
-    // SAFETY: boot services are still active.
-    let mappings = unsafe { guest.check_mappings() }?;
-    report::guest_mappings(&guest, &mappings);
+    // Only the test guest runs from pages of Aleph0's. The firmware, launched
+    // in place, runs from its own memory, so it gets none, and EPT protects
+    // none of Aleph0's pages for it.
+    let guest = match GuestKind::SELECTED {
+        GuestKind::BuiltInTest => Some(allocate_test_guest()?),
+        GuestKind::Firmware => None,
+    };
 
     let (controls, ept_support) = check_vmx_support()?;
 
@@ -318,18 +317,22 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
     let mtrrs = MtrrState::new(vmx::mtrr::read()?)?;
     let capabilities = mtrrs.registers().capabilities();
     report::mtrrs(mtrrs.mtrrs());
-    let protected_pages = [guest.data_page(), guest.stack_page()];
+    let test_pages = guest.as_ref().map(|guest| [guest.data_page(), guest.stack_page()]);
+    let protected_pages: &[u64] = match &test_pages {
+        Some(pages) => pages,
+        None => &[],
+    };
     // SAFETY: boot services are still active, and UEFI identity-maps
     // memory, which also makes the guest pages' addresses their GPAs.
     let (ept, types) = unsafe {
         Ept::build(
-            &protected_pages,
+            protected_pages,
             ept_support,
             mtrrs.mtrrs(),
             ept::spare_pts(capabilities),
         )
     }?;
-    report::ept(&ept, &types, &protected_pages);
+    report::ept(&ept, &types, protected_pages);
     let _local_apic = check_local_apic(&ept, &types, ept_support)?;
     // Test only: the guest's read of the Local APIC then meets a PDPT entry
     // the CPU refuses, so the run shows the EPT misconfiguration stop and
@@ -401,6 +404,28 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
         types,
         cr_controls,
     })
+}
+
+/// Allocates the test guest's pages and checks how the page tables, which it
+/// shares, map them.
+fn allocate_test_guest() -> Result<GuestMemory, BringUpError> {
+    let guest = GuestMemory::allocate()?;
+    log!(
+        "Guest memory allocated: code={:#018x} ({} bytes copied) stack top={:#018x}.",
+        guest.code_base(),
+        guest.code_len(),
+        guest.stack_top(),
+    );
+    log!(
+        "Guest IDT at {:#018x} (limit {:#06x}): vector 2 -> NMI handler at {:#018x}.",
+        guest.idt().base,
+        guest.idt().limit,
+        guest.nmi_handler(),
+    );
+    // SAFETY: boot services are still active.
+    let mappings = unsafe { guest.check_mappings() }?;
+    report::guest_mappings(&guest, &mappings);
+    Ok(guest)
 }
 
 /// Builds a GDT that adds a TSS descriptor to a copy of the firmware's GDT,
@@ -499,20 +524,22 @@ fn check_vmx_support() -> Result<(VmcsControlMsrs, EptSupport), BringUpError> {
 fn launch_guest(
     controls: &VmcsControlMsrs,
     vmexit_stack: &VmExitStack,
-    guest: &GuestMemory,
+    guest: Option<&GuestMemory>,
     ept: &Ept,
     host: &HostEnvironment,
     bitmaps: &ExitBitmaps,
     context_tables: &ContextTables,
 ) -> Result<GuestRun, BringUpError> {
     let kind = GuestKind::SELECTED;
-    let entry = match kind {
-        GuestKind::BuiltInTest => GuestEntry::At {
+    // The test guest, which alone has pages of its own (`enter_vmx`), starts
+    // at its code; the firmware goes on in place.
+    let entry = match guest {
+        Some(guest) => GuestEntry::At {
             rip: guest.code_base(),
             rsp: guest.stack_top(),
             idtr: guest.idt(),
         },
-        GuestKind::Firmware => GuestEntry::InPlace {
+        None => GuestEntry::InPlace {
             idtr: context_tables.idtr,
         },
     };

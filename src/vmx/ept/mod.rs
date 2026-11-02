@@ -43,9 +43,10 @@
 //! ([`EptTypes`]). The GiBs the UEFI memory map reaches are mapped through
 //! PDs, in 2 MiB and 4 KiB pages; above them, where there is no RAM, each
 //! GiB is one UC 1 GiB page. A few named 4 KiB pages are mapped read-only
-//! ([`MAX_PROTECTED`] at most): the guest's data page, so its write is the
-//! intentional EPT violation, and the guest's stack page, so the reinjected
-//! NMI's delivery faults when the CPU pushes the interrupt frame. Each
+//! ([`MAX_PROTECTED`] at most), for the test guest only: its data page, so
+//! its write is the intentional EPT violation, and its stack page, so the
+//! reinjected NMI's delivery faults when the CPU pushes the interrupt frame.
+//! The firmware guest runs from its own memory and gets none. Each
 //! [`ProtectedPage::grant_write`] makes its page writable when that page's
 //! violation arrives.
 //!
@@ -1078,7 +1079,8 @@ impl Ept {
     /// Builds the identity map from the UEFI memory map, laid out for the
     /// CPU's `support` ([`MapLayout`]), with the memory types of `mtrrs` for
     /// its RAM and UC for everything else ([`EptTypes`]), each of
-    /// `protected_pages` read-only, `spare_pts` more PTs set aside for the
+    /// `protected_pages` read-only (the test guest's; none for the firmware),
+    /// `spare_pts` more PTs set aside for the
     /// guest's MTRR writes ([`spare_pts`]) and [`HIDE_PTS`] more for hiding
     /// Aleph0's own pages ([`TypeTables::hide`]), and a shadow page allocated
     /// for them. Publishes the [`ProtectedPage`]s the exit handler needs
@@ -1217,7 +1219,7 @@ impl Ept {
                 invept: support.invept,
             };
         }
-        publish(&pages[..protected_pages.len()])?;
+        publish(ept.eptp, support.invept, &pages[..protected_pages.len()])?;
         Ok((ept, tables))
     }
 
@@ -1826,10 +1828,11 @@ fn decode_invept(value: u8) -> Option<InveptType> {
     }
 }
 
-/// Publishes `pages` for [`protected_page_for`]. Refuses a second
-/// publication. `pages` holds at most [`MAX_PROTECTED`] entries, all sharing
-/// one EPTP and INVEPT type.
-fn publish(pages: &[ProtectedPage]) -> Result<(), EptError> {
+/// Publishes `pages` for [`protected_page_for`], with the tables' `eptp` and
+/// `invept` type. Refuses a second publication. `pages` holds at most
+/// [`MAX_PROTECTED`] entries, and none for the firmware guest, which has no
+/// page of Aleph0's to protect: the tables are published all the same.
+fn publish(eptp: Eptp, invept: InveptType, pages: &[ProtectedPage]) -> Result<(), EptError> {
     if decode_invept(INVEPT_TYPE.load(Ordering::Acquire)).is_some() {
         return Err(EptError::AlreadyBuilt);
     }
@@ -1839,12 +1842,8 @@ fn publish(pages: &[ProtectedPage]) -> Result<(), EptError> {
         PROTECTED_ENTRIES[slot].store(page.entry, Ordering::Relaxed);
     }
     PROTECTED_COUNT.store(pages.len(), Ordering::Relaxed);
-    // Every published page shares the one EPTP and INVEPT type; take them
-    // from the first (there is always at least the data page).
-    if let Some(first) = pages.first() {
-        PUBLISHED_EPTP.store(first.eptp.raw(), Ordering::Relaxed);
-        INVEPT_TYPE.store(first.invept as u8, Ordering::Release);
-    }
+    PUBLISHED_EPTP.store(eptp.raw(), Ordering::Relaxed);
+    INVEPT_TYPE.store(invept as u8, Ordering::Release);
     Ok(())
 }
 

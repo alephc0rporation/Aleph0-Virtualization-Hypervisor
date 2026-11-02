@@ -194,9 +194,10 @@ Aleph0 (HYPERV_INTERFACE.md section 7). Left alone at that screen, it ran
   interrupt window, and the firmware's interrupts pass straight through to
   its IDT, for an OS too ([NMI.md](NMI.md) sections 5, 7 and 8; #26's
   Hyper-V runs are recorded there).
-- The firmware guest still gets the test guest's pages, because `Ept::build`
-  protects their data page. Nothing in the firmware touches it, and since
-  #23 they are resident, so no OS reuses them either.
+- The firmware guest gets none of the test guest's pages: launched in place,
+  it runs from its own memory, so nothing is allocated for it and EPT
+  protects no page of Aleph0's (`Ept::build` with no protected page). Only
+  the test guest allocates them.
 - Staying resident after `ExitBootServices` (#23): since #27 the harness
   runs past `0x40000020`, exits boot services as Aleph0's guest and
   overwrites every reclaimable page, and Aleph0 still handles its exits
