@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/mascot.gif" alt="Aleph0 mascot: a vampire cat rising from a coffin" width="256">
+</p>
+
 # Aleph0 Virtualization Hypervisor
 
 [![CI](https://github.com/alephc0rporation/Aleph0-Virtualization-Hypervisor/actions/workflows/ci.yml/badge.svg)](https://github.com/alephc0rporation/Aleph0-Virtualization-Hypervisor/actions/workflows/ci.yml)
