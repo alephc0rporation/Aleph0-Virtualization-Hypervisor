@@ -4,7 +4,6 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](rust-toolchain.toml)
 [![Target: x86_64-unknown-uefi](https://img.shields.io/badge/target-x86__64--unknown--uefi-informational.svg)](.cargo/config.toml)
-[![Star History Chart](https://api.star-history.com/chart?repos=alephc0rporation/aleph0-virtualization-hypervisor&type=date&legend=bottom-right)](https://www.star-history.com/?repos=alephc0rporation%2Faleph0-virtualization-hypervisor&type=date&legend=bottom-right)
 
 VMpire, the Aleph0 Virtualization Hypervisor, is an Intel VT-x hypervisor
 written in Rust and booted as a UEFI application. Aleph0 is being built to
