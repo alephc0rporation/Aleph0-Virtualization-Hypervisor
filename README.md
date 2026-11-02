@@ -5,6 +5,16 @@
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](rust-toolchain.toml)
 [![Target: x86_64-unknown-uefi](https://img.shields.io/badge/target-x86__64--unknown--uefi-informational.svg)](.cargo/config.toml)
 
+## Star History
+
+<a href="https://www.star-history.com/?repos=alephc0rporation%2Faleph0-virtualization-hypervisor&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=alephc0rporation/aleph0-virtualization-hypervisor&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=alephc0rporation/aleph0-virtualization-hypervisor&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=alephc0rporation/aleph0-virtualization-hypervisor&type=date&legend=top-left" />
+ </picture>
+</a>
+
 An Intel VT-x hypervisor written in Rust and booted as a UEFI application.
 Aleph0 is being built to stay resident after `ExitBootServices` and run an
 operating system as its guest, with EPT memory isolation and multiple vCPUs.
