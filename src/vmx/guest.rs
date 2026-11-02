@@ -573,11 +573,10 @@ impl GuestMemory {
     /// The code and data pages are one two-page [`RESIDENT_CODE`]
     /// allocation: a code type because firmware may map data types
     /// no-execute, and one allocation because the guest finds the data page
-    /// right after its code. The stack and IDT pages are resident data. All
-    /// four are resident although the test guest never runs after
-    /// `ExitBootServices`: EPT keeps the data page read-only for the firmware
-    /// guest too, so an OS reusing it would stop at an EPT violation. The
-    /// gate uses the current CS selector, which the guest state copies.
+    /// right after its code. The stack and IDT pages are resident data, like
+    /// every page Aleph0 keeps, which bring-up checks. Only the test guest has
+    /// them: the firmware, launched in place, gets none. The gate uses the
+    /// current CS selector, which the guest state copies.
     pub fn allocate() -> Result<Self, GuestMemoryError> {
         let code_bytes = guest_code();
         if code_bytes.len() > PAGE_SIZE {

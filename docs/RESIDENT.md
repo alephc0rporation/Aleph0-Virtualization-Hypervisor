@@ -56,10 +56,9 @@ as runtime memory, maps them for runtime services and gives them a virtual
 address in `SetVirtualAddressMap`. It never writes them; hiding them from the
 guest is EPT's job, after the first boot (ROADMAP section 5).
 
-The test guest's pages are resident too, although the test guest never runs
-after `ExitBootServices`: `Ept::build` keeps its data page read-only for the
-firmware guest as well, so an OS that reused that page would stop at an EPT
-violation.
+The test guest's pages are resident too, like every page Aleph0 keeps, and
+are allocated for the test guest only: the firmware guest, launched in place,
+gets none, so no page of them is left for an OS to meet.
 
 Every resident allocation is listed (`page::resident_allocations`, up to
 64). Before the launch, bring-up reads the memory map, prints each
