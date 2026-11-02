@@ -177,8 +177,8 @@ diagnostics that run before VMXON.
 | `src/vmx/page.rs` | Page allocation in the resident memory types, with the list of resident allocations bring-up checks |
 | `src/bring_up/` | The bring-up sequence (`mod.rs`), its errors (`error.rs`), status lines (`report.rs`) and the return to firmware (`teardown.rs`) |
 | `src/output.rs` | Output phases and the firmware-free panic handler |
-| `src/serial.rs` | Serial logger usable without firmware, on COM2 (`SerialPort`); COM1 is left to the guest |
-| `src/port.rs` | in/out of 1, 2 and 4 bytes, for the serial driver and the exit handler |
+| `crates/uart/src/serial.rs` | Serial logger usable without firmware, on COM2 (`SerialPort`); COM1 is left to the guest |
+| `crates/uart/src/port.rs` | in/out of 1, 2 and 4 bytes, for the serial driver and the exit handler |
 | `src/vmx/cpuid.rs`, `msr.rs`, `cr.rs` | CPU feature, MSR and control-register access, with the CR0/CR4 guest/host masks and read shadows that hide VMXE from the guest (see [docs/CONTROL_REGISTERS.md](docs/CONTROL_REGISTERS.md)) |
 | `src/vmx/context_tables.rs`, `segment.rs` | The GDT copy with a TSS that bring-up and the test guest run on, and the TSS layout; gate and descriptor encoding, segmentation state |
 | `src/vmx/host/` | What VMX root operation runs on: Aleph0's page tables (`page_tables.rs`), GDT (`gdt.rs`), IDT with interrupt stacks (`idt.rs`) and the NMI and fault handlers (`handlers.rs`) |

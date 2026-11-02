@@ -1,7 +1,7 @@
 # Serial logging
 
 How Aleph0 gets debug output out of places where the firmware console cannot
-be used, and how to read it. The code is `src/serial.rs`; its module comment
+be used, and how to read it. The code is `crates/uart/src/serial.rs`; its module comment
 covers the register-level details.
 
 - New to this? Read the [beginner walkthrough](#beginner-walkthrough) first.
@@ -49,7 +49,7 @@ unknown device, and the console says so. It never falls back to COM1.
 ## Beginner walkthrough
 
 The same driver, one step at a time, in the order the code runs. The step
-numbers match the `Step N` comments in `src/serial.rs`.
+numbers match the `Step N` comments in `crates/uart/src/serial.rs`.
 
 ```
  Your Rust code            The UART chip              The outside world
@@ -73,7 +73,7 @@ Only two instructions use them:
 | `out dx, al` | send the byte in AL to port number DX |
 | `in al, dx` | read a byte from port number DX into AL |
 
-`src/port.rs` wraps them in `outb(port, value)` and `inb(port) -> u8`, which
+`crates/uart/src/port.rs` wraps them in `outb(port, value)` and `inb(port) -> u8`, which
 `serial.rs` uses. Every other step is just calls to these two. The full story
 (instruction forms, what happens on the bus, ordering, privilege,
 virtualization) is in [PORT_IO.md](PORT_IO.md).

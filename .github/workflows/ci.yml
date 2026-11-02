@@ -28,3 +28,7 @@ jobs:
       - run: cargo clippy -p ebs-harness --features set-virtual-address-map -- -D warnings
       - run: cargo test -p ebs-harness --target x86_64-pc-windows-msvc
       - run: cargo clippy -p ebs-harness --target x86_64-pc-windows-msvc --tests -- -D warnings
+      - run: cargo test -p uart --target x86_64-pc-windows-msvc
+      - run: cargo clippy -p uart -- -D warnings
+      - run: cargo clippy -p uart --target x86_64-pc-windows-msvc --tests -- -D warnings
+      - run: cargo clippy -p os-loader -- -D warnings

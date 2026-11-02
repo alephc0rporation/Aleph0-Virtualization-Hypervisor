@@ -881,6 +881,8 @@ pub fn decide(guest: GuestKind, state: ExitState, exit: ExitInfo) -> (ExitEvent,
     let test_guest = guest == GuestKind::BuiltInTest;
     match exit.reason.basic {
         EXIT_REASON_CPUID => (emulation::cpuid(&exit), state),
+        // Test only: the OS kernel's XSETBV stops it (`os-stop-test`).
+        EXIT_REASON_XSETBV if cfg!(feature = "os-stop-test") => (ExitEvent::Unexpected, state),
         EXIT_REASON_XSETBV => (emulation::xsetbv(&exit), state),
         EXIT_REASON_RDMSR => (emulation::rdmsr(&exit), state),
         EXIT_REASON_WRMSR => (emulation::wrmsr(&exit), state),
