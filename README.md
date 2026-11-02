@@ -1,6 +1,4 @@
-<img src="docs/mascot.gif" alt="Aleph0 mascot: a vampire cat rising from a coffin" width="128" align="right">
-
-# Aleph0 Virtualization Hypervisor
+# Aleph0 Virtualization Hypervisor <img src="docs/mascot.gif" alt="Aleph0 mascot: a vampire cat rising from a coffin" width="128" align="right">
 
 [![CI](https://github.com/alephc0rporation/Aleph0-Virtualization-Hypervisor/actions/workflows/ci.yml/badge.svg)](https://github.com/alephc0rporation/Aleph0-Virtualization-Hypervisor/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
