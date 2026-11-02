@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="docs/mascot.gif" alt="Aleph0 mascot: a vampire cat rising from a coffin" width="256">
-</p>
+<img src="docs/mascot.gif" alt="Aleph0 mascot: a vampire cat rising from a coffin" width="128" align="right">
 
 # Aleph0 Virtualization Hypervisor
 
