@@ -7,7 +7,8 @@
 [![Star History Chart](https://api.star-history.com/chart?repos=alephc0rporation/aleph0-virtualization-hypervisor&type=date&legend=bottom-right)](https://www.star-history.com/?repos=alephc0rporation%2Faleph0-virtualization-hypervisor&type=date&legend=bottom-right)
 
 VMpire, the Aleph0 Virtualization Hypervisor, is an Intel VT-x hypervisor
-written in Rust and booted as a UEFI application. Aleph0 is being built to stay resident after `ExitBootServices` and run an
+written in Rust and booted as a UEFI application. Aleph0 is being built to
+stay resident after `ExitBootServices` and run an
 operating system as its guest, with EPT memory isolation and multiple vCPUs.
 The project is also a study of AI-driven development in low-level `unsafe`
 Rust.
