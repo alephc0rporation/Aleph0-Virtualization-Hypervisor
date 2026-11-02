@@ -14,19 +14,13 @@
 //! The loader prints on COM1, the kernel's console, before the kernel does;
 //! Aleph0 prints on COM2.
 
-#![no_main]
-#![no_std]
+// A test build (rust-analyzer checks every target) links std and its panic
+// handler; the UEFI build is no_std with a firmware entry point.
+#![cfg_attr(not(test), no_main)]
+#![cfg_attr(not(test), no_std)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 extern crate alloc;
-
-// Aleph0's own UART driver, as the ExitBootServices harness uses it.
-#[allow(dead_code)]
-#[path = "../../../src/port.rs"]
-mod port;
-#[allow(dead_code)]
-#[path = "../../../src/serial.rs"]
-mod serial;
 
 use core::arch::x86_64::__cpuid;
 
@@ -34,7 +28,9 @@ use uefi::boot::{self, LoadImageSource};
 use uefi::prelude::*;
 use uefi::{CStr16, cstr16};
 
-use serial::SerialPort;
+// Aleph0's own UART driver (`crates/uart`), as the harness uses it.
+use uart::serial::{self, SerialPort};
+use uart::serial_println;
 
 /// Prefix of every line the loader prints.
 const TAG: &str = "[os-loader]";
@@ -54,7 +50,7 @@ const KERNEL_PATH: &CStr16 = cstr16!("\\EFI\\aleph0\\linux.efi");
 /// CPUID.1:ECX bit 5: VMX, which Aleph0 hides from its guest.
 const CPUID_1_ECX_VMX: u32 = 1 << 5;
 
-#[entry]
+#[cfg_attr(not(test), entry)]
 fn main() -> Status {
     if serial::init(SerialPort::COM1).is_err() {
         // Nowhere to report anything.
@@ -96,6 +92,7 @@ fn start(path: &CStr16) -> uefi::Result {
     boot::start_image(image)
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     say!("PANIC: {info}");

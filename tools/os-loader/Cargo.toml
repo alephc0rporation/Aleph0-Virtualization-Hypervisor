@@ -7,4 +7,10 @@ publish = false
 
 # `alloc` only to read the two images from the ESP.
 [dependencies]
+uart = { path = "../../crates/uart" }
+uefi = { version = "0.40", features = ["alloc"] }
+
+# The firmware's pool as the global allocator, for the .efi only: a test
+# build allocates from std's.
+[target.'cfg(target_os = "uefi")'.dependencies]
 uefi = { version = "0.40", features = ["alloc", "global_allocator"] }

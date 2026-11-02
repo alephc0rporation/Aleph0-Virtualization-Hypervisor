@@ -36,18 +36,12 @@
 
 extern crate alloc;
 
-// Aleph0's own sources, so that the harness and Aleph0 agree: the UART
-// driver, the VMCALL values, and which memory the OS may reclaim. Aleph0
-// uses all of them; the harness only some.
+// Aleph0's own sources, so that the harness and Aleph0 agree: the VMCALL
+// values, and which memory the OS may reclaim. Aleph0 uses all of them; the
+// harness only some. The UART driver is the shared `uart` crate.
 #[allow(dead_code)]
 #[path = "../../../src/resident/memory.rs"]
 mod memory;
-#[allow(dead_code)]
-#[path = "../../../src/port.rs"]
-mod port;
-#[allow(dead_code)]
-#[path = "../../../src/serial.rs"]
-mod serial;
 #[allow(dead_code)]
 #[path = "../../../src/vmx/vmcall.rs"]
 mod vmcall;
@@ -66,7 +60,8 @@ use uefi::proto::loaded_image::LoadedImage;
 use uefi::{CStr16, cstr16};
 
 use paging::PageTables;
-use serial::SerialPort;
+use uart::serial::{self, SerialPort};
+use uart::serial_println;
 
 /// Prefix of every line the harness prints.
 const TAG: &str = "[ebs-harness]";

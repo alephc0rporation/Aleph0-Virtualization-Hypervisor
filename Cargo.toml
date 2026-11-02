@@ -6,12 +6,14 @@ license = "MIT OR Apache-2.0"
 
 # The ExitBootServices test harness (docs/RESIDENT.md, `cargo build -p
 # ebs-harness`) and the OS loader (docs/LINUX_GUEST.md, `cargo build -p
-# os-loader`), each its own EFI application. Cargo commands run at the root
-# still act on Aleph0 alone.
+# os-loader`), each its own EFI application, and the UART driver all three
+# print with (`crates/uart`, `cargo test -p uart`). Cargo commands run at the
+# root still act on Aleph0 alone.
 [workspace]
-members = ["tools/ebs-harness", "tools/os-loader"]
+members = ["crates/uart", "tools/ebs-harness", "tools/os-loader"]
 
 [dependencies]
+uart = { path = "crates/uart" }
 uefi = "0.40"
 
 # Switches for the Hyper-V runner (`-Features`, `-TestGuest`); all are off by

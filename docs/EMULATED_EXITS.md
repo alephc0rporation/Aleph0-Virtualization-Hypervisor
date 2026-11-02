@@ -22,7 +22,7 @@ Code:
 - `src/vmx/vmexit/handler.rs`: `execute`, `prepare_resume`, `queue_exception`;
 - `src/vmx/vmexit/guest_mtrrs.rs`: the guest's copy of its MTRRs, which its RDMSR and WRMSR of them reach;
 - `src/vmx/vmexit/report.rs`: the report lines;
-- `src/port.rs`: `in`/`out` of 1, 2 and 4 bytes;
+- `crates/uart/src/port.rs`: `in`/`out` of 1, 2 and 4 bytes;
 - `src/vmx/guest.rs`: the guest code that causes the exits, and its checks;
 - `src/bring_up/mod.rs`: `PassthroughState`.
 
@@ -479,7 +479,7 @@ For `in al, dx` with `dx = 0x3FF` the qualification is `0x03FF0008`: port
 `0x3FF` in bits 31:16, direction bit set, size 1. For `out dx, al` it is
 `0x03FF0000`. An OUT sends the value in AL, AX or EAX of the guest's RAX
 (`out_value`); an IN merges into RAX as in section 2. `execute` runs the
-matching function of `src/port.rs` (`inb`, `inw`, `inl`, `outb`, `outw`,
+matching function of `crates/uart/src/port.rs` (`inb`, `inw`, `inl`, `outb`, `outw`,
 `outl`).
 
 The encoding 2 of the size field is unused, and a **string or REP form

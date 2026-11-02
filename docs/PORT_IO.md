@@ -3,7 +3,7 @@
 A reference for the `in` and `out` instructions: what the I/O address space
 is, how a port access travels from the CPU to a device, the rules that make
 it different from memory, and how a hypervisor intercepts it. Aleph0 uses
-port I/O for the serial port (`src/serial.rs`, see
+port I/O for the serial port (`crates/uart/src/serial.rs`, see
 [SERIAL_LOGGING.md](SERIAL_LOGGING.md)); the same mechanism drives the timer,
 the interrupt controller, the keyboard controller and PCI configuration.
 
@@ -62,7 +62,7 @@ The data always travels through the **A register**, in one of three sizes:
 There is **no 64-bit port I/O**. A 16-bit access to port `P` covers ports `P`
 and `P + 1`; a 32-bit access covers `P` to `P + 3`. Use the size the device
 register expects: the UART's registers are all 8-bit, so serial code only
-uses `inb`/`outb`. Aleph0 keeps all six functions in `src/port.rs`.
+uses `inb`/`outb`. Aleph0 keeps all six functions in `crates/uart/src/port.rs`.
 
 The string forms `ins`/`outs` (usually with `rep`) move a block of data
 between memory and one port; disk controllers used them. Aleph0 does not.

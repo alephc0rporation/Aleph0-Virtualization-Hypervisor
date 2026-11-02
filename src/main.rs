@@ -27,10 +27,13 @@ macro_rules! log {
 
 mod bring_up;
 mod output;
-mod port;
 mod resident;
-mod serial;
 mod vmx;
+
+// The UART driver, shared with the tools (`crates/uart`); imported here so
+// the rest of Aleph0 reaches it as `crate::port`, `crate::serial` and
+// `crate::serial_println!`.
+use uart::{port, serial, serial_print, serial_println};
 
 /// Prefix for every line this hypervisor prints, on screen and on serial.
 pub const TAG: &str = "[Aleph0 Virtualization Hypervisor]";

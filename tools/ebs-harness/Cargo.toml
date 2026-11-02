@@ -7,6 +7,7 @@ publish = false
 
 # `alloc` only to read Aleph0's image from the ESP, before ExitBootServices.
 [dependencies]
+uart = { path = "../../crates/uart" }
 uefi = { version = "0.40", features = ["alloc"] }
 
 # The firmware's pool as the global allocator, for the .efi only: the host
