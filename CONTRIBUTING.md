@@ -182,10 +182,10 @@ Update the documentation in the same pull request as the code:
 
 ## Scope
 
-The end goal is anti-cheat research (see [ROADMAP.md](ROADMAP.md), section 6).
-Contributions must stay within that: research only, no deployment against
-third-party services, and nothing whose purpose is to evade or defeat
-anti-cheat or other security software.
+Contributions must stay research only: no deployment against third-party
+services, and nothing whose purpose is to evade or defeat security software.
+What the hypervisor is used for after the first OS boot is not decided yet
+(see [ROADMAP.md](ROADMAP.md), section 6).
 
 ## License
 

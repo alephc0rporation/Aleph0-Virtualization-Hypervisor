@@ -49,8 +49,8 @@ violation**.
 This is the basis for everything later:
 - an OS guest gets memory isolated from Aleph0;
 - Aleph0 can hide its own pages from the guest;
-- for anti-cheat (ROADMAP section 6), it can make a game's pages read-only
-  or execute-only and see every write to them.
+- for research on top of it (ROADMAP section 6), it can make chosen guest
+  pages read-only or execute-only and see every write to them.
 
 ## 2. EPT entries and the EPT pointer
 

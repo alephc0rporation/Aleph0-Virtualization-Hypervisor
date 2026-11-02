@@ -8,11 +8,8 @@
 An Intel VT-x hypervisor written in Rust and booted as a UEFI application.
 Aleph0 is being built to stay resident after `ExitBootServices` and run an
 operating system as its guest, with EPT memory isolation and multiple vCPUs.
-The end goal is research into game anti-cheat: running below the guest OS,
-the hypervisor can watch and protect a game's memory where kernel-mode cheats
-cannot reach. The project is also a study of AI-driven development in
-low-level `unsafe` Rust, and of AI-assisted reverse-engineering tooling for
-the analysis the anti-cheat needs.
+The project is also a study of AI-driven development in low-level `unsafe`
+Rust.
 
 ## Status
 
@@ -49,8 +46,9 @@ Verified on Hyper-V with nested virtualization:
       page, the image copy kept read-only but executable; the firmware
       and the ExitBootServices harness run on with it on Hyper-V
 - [ ] An OS guest on multiple vCPUs
-- [ ] Anti-cheat research: guest memory introspection, EPT protection and
-      split views, watching privileged changes
+- [ ] Research on top of the hypervisor, direction undecided: guest memory
+      introspection, EPT protection and split views, watching privileged
+      changes
 
 See [ROADMAP.md](ROADMAP.md) for the details of each step and what comes next.
 
