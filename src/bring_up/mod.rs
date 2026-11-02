@@ -318,7 +318,10 @@ fn enter_vmx(context_tables: &ContextTables) -> Result<VmxEntry, BringUpError> {
     let capabilities = mtrrs.registers().capabilities();
     report::mtrrs(mtrrs.mtrrs());
     let test_pages = guest.as_ref().map(|guest| [guest.data_page(), guest.stack_page()]);
-    let protected_pages = test_pages.as_ref().map_or(&[][..], <[u64; 2]>::as_slice);
+    let protected_pages: &[u64] = match &test_pages {
+        Some(pages) => pages,
+        None => &[],
+    };
     // SAFETY: boot services are still active, and UEFI identity-maps
     // memory, which also makes the guest pages' addresses their GPAs.
     let (ept, types) = unsafe {
