@@ -14,3 +14,6 @@ uefi = { version = "0.40", features = ["alloc"] }
 # build allocates from std's.
 [target.'cfg(target_os = "uefi")'.dependencies]
 uefi = { version = "0.40", features = ["alloc", "global_allocator"] }
+
+[lints]
+workspace = true

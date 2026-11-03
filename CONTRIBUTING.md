@@ -35,14 +35,15 @@ verified. [README.md](README.md) covers building and running;
 cargo build                                            # the .efi
 cargo test-host                                        # host unit tests
 cargo fmt --all --check                                # rustfmt.toml: 120 columns, both packages
-cargo clippy                                           # lints for the UEFI build
-cargo clippy --features test-guest                     # lints for the regression mode
+cargo hack clippy --workspace --each-feature           # lints for the UEFI build, every package and feature
 cargo clippy --target x86_64-pc-windows-msvc --tests   # lints for the tests
-cargo clippy -p ebs-harness                            # lints for the ExitBootServices harness
-cargo clippy -p ebs-harness --features set-virtual-address-map
 cargo test -p ebs-harness --target x86_64-pc-windows-msvc            # its host tests
 cargo clippy -p ebs-harness --target x86_64-pc-windows-msvc --tests  # lints for them
+typos                                                  # spelling; allowed words in _typos.toml
 ```
+
+`cargo hack` and `typos` are installed with `cargo install cargo-hack
+typos-cli`.
 
 All of them must pass without warnings. Use your host triple instead of
 `x86_64-pc-windows-msvc` on Linux or macOS. The harness (`tools/ebs-harness`)
@@ -53,10 +54,16 @@ alone.
 
 ### `unsafe`
 
+- The lints live in `[workspace.lints]` in the root `Cargo.toml` and apply
+  to every package.
 - `clippy::undocumented_unsafe_blocks` is on. Every `unsafe` block has a
   `// SAFETY:` comment that says why it is sound here, not what it does.
 - Every `unsafe fn` has a `# Safety` section listing what its callers must
-  guarantee (for example "VMX root operation, with the guest's VMCS current").
+  guarantee (for example "VMX root operation, with the guest's VMCS current");
+  `clippy::missing_safety_doc` checks it.
+- Widening casts are spelled `u64::from(x)`, so an `as` cast is always one
+  that can drop bits (`clippy::cast_lossless`, `cast_sign_loss`,
+  `cast_possible_wrap`).
 - Keep `unsafe` blocks as small as the operation that needs them.
 
 ### Separate deciding from doing

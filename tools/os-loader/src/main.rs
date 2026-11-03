@@ -18,7 +18,6 @@
 // handler; the UEFI build is no_std with a firmware entry point.
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
-#![warn(clippy::undocumented_unsafe_blocks)]
 
 extern crate alloc;
 

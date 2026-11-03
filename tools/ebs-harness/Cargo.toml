@@ -24,3 +24,6 @@ set-virtual-address-map = []
 # switch to the harness's own tables, SetVirtualAddressMap and the overwrite
 # on the firmware alone (`run-hyperv.ps1 -Harness -WithoutAleph0`).
 without-aleph0 = []
+
+[lints]
+workspace = true

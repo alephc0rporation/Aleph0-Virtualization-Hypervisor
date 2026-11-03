@@ -313,7 +313,7 @@ pub unsafe fn vmread(field_encoding: u32) -> Result<u64, VmcsError> {
             // Cast to u64 like vmwrite does: `{field:r}` names the full
             // 64-bit register, and a u32 input leaves its upper half
             // undefined, which the CPU would read as part of the encoding.
-            field = in(reg) field_encoding as u64,
+            field = in(reg) u64::from(field_encoding),
             rflags = lateout(reg) rflags,
         );
     }
@@ -344,7 +344,7 @@ pub unsafe fn vmwrite(field_encoding: u32, value: u64) -> Result<(), VmcsError> 
             "pushfq",
             "pop {rflags}",
             value = in(reg) value,
-            field = in(reg) field_encoding as u64,
+            field = in(reg) u64::from(field_encoding),
             rflags = lateout(reg) rflags,
         );
     }

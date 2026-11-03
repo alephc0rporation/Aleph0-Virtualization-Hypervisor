@@ -196,7 +196,8 @@ pub(super) fn hlt() -> ExitEvent {
 /// With 5-level paging (CR4.LA57) it would be bits 63:56; Aleph0's guest
 /// shares the host's CR4, which UEFI leaves without LA57.
 pub fn is_canonical_48(value: u64) -> bool {
-    ((value as i64) << 16 >> 16) as u64 == value
+    let high_bits = value >> 47;
+    high_bits == 0 || high_bits == 0x1_FFFF
 }
 
 /// What an RDMSR or WRMSR of an MSR gets.
