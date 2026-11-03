@@ -1,0 +1,10 @@
+# Spell check of code, comments and docs (`typos`, run in CI). Words here are
+# hardware terms the checker would otherwise "correct".
+[default.extend-words]
+# Interrupt Stack Table: the TSS's stack list and an IDT gate's index into it.
+ist = "ist"
+ists = "ists"
+# PCI Base Address Register (BARs).
+ba = "ba"
+# 16550 UART Transmit Holding Register.
+thr = "thr"

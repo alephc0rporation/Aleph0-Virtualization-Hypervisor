@@ -245,7 +245,7 @@ pub unsafe fn rdmsr(msr: u32) -> u64 {
         );
     }
 
-    ((high as u64) << 32) | low as u64
+    (u64::from(high) << 32) | u64::from(low)
 }
 
 /// Writes an arbitrary MSR.

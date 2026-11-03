@@ -8,3 +8,6 @@ publish = false
 # Aleph0's port I/O and 16550 UART driver, shared with the tools that boot
 # it (ebs-harness, os-loader), so all three print the same way.
 [dependencies]
+
+[lints]
+workspace = true

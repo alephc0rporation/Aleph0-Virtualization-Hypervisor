@@ -12,6 +12,27 @@ license = "MIT OR Apache-2.0"
 [workspace]
 members = ["crates/uart", "tools/ebs-harness", "tools/os-loader"]
 
+# Lints for every crate in the workspace; each crate opts in with
+# `[lints] workspace = true`. CI denies warnings, so `warn` here fails CI too.
+[workspace.lints.clippy]
+# Every `unsafe` block says why it is sound here (`// SAFETY:`), and every
+# `unsafe fn` lists its callers' obligations (`# Safety`).
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "warn"
+# `as` casts that change sign or widen: a widening cast is spelled
+# `u64::from(x)`, so every `as` left is one that can lose bits.
+cast_sign_loss = "warn"
+cast_possible_wrap = "warn"
+cast_lossless = "warn"
+# Not yet on; each needs its own pass over the code first:
+# - multiple_unsafe_ops_per_block (43 blocks): one unsafe operation per
+#   block, so each `// SAFETY:` covers exactly one.
+# - cast_possible_truncation (108 casts): mostly deliberate narrowing of
+#   VMCS fields and registers, each to be confirmed or made explicit.
+
+[lints]
+workspace = true
+
 [dependencies]
 uart = { path = "crates/uart" }
 uefi = "0.40"

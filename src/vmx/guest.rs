@@ -424,10 +424,11 @@ unsafe extern "C" {
 fn guest_code() -> &'static [u8] {
     let start = &raw const guest_code_start;
     let end = &raw const guest_code_end;
-    // SAFETY: both labels come from the one asm block above, start before
-    // end, so the range is the assembled code: initialised, in the image for
+    // The labels come from the one asm block above, start before end.
+    let len = end.addr() - start.addr();
+    // SAFETY: the range is the assembled code: initialised, in the image for
     // as long as it runs, and never written.
-    unsafe { core::slice::from_raw_parts(start, end.offset_from(start) as usize) }
+    unsafe { core::slice::from_raw_parts(start, len) }
 }
 
 /// Offset of `guest_nmi_handler` from the start of the guest code, which is
@@ -435,9 +436,8 @@ fn guest_code() -> &'static [u8] {
 fn nmi_handler_offset() -> usize {
     let start = &raw const guest_code_start;
     let handler = &raw const guest_nmi_handler;
-    // SAFETY: both labels come from the one asm block above, so they point
-    // into the same object, start before handler.
-    unsafe { handler.offset_from(start) as usize }
+    // Both labels come from the one asm block above, start before handler.
+    handler.addr() - start.addr()
 }
 
 /// Byte offset of the NMI gate (vector 2) in the guest IDT.

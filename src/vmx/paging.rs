@@ -244,7 +244,7 @@ pub fn walk(cr3: u64, virtual_address: u64, read_entry: impl Fn(u64) -> u64) -> 
     for level in (1..=4u8).rev() {
         // This level's 9-bit index: bits 47:39 at level 4, 38:30 at level 3,
         // 29:21 at level 2, 20:12 at level 1.
-        let shift = 12 + 9 * (level as u32 - 1);
+        let shift = 12 + 9 * (u32::from(level) - 1);
         let index = (virtual_address >> shift) & 0x1FF;
         let entry = read_entry(table + index * 8);
 

@@ -18,17 +18,26 @@ jobs:
       # Installs the toolchain and UEFI target from rust-toolchain.toml.
       - run: rustup toolchain install
       - run: rustup component add rustfmt clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
       - run: cargo build
       - run: cargo test-host
       - run: cargo fmt --all --check
-      - run: cargo clippy -- -D warnings
-      - run: cargo clippy --features test-guest -- -D warnings
+      # Every package of the UEFI build, once with no features, once with
+      # each feature alone and once with all of them, so code behind a test
+      # switch cannot stop compiling unnoticed.
+      - run: cargo hack clippy --workspace --each-feature -- -D warnings
       - run: cargo clippy --target x86_64-pc-windows-msvc --tests -- -D warnings
-      - run: cargo clippy -p ebs-harness -- -D warnings
-      - run: cargo clippy -p ebs-harness --features set-virtual-address-map -- -D warnings
       - run: cargo test -p ebs-harness --target x86_64-pc-windows-msvc
       - run: cargo clippy -p ebs-harness --target x86_64-pc-windows-msvc --tests -- -D warnings
       - run: cargo test -p uart --target x86_64-pc-windows-msvc
-      - run: cargo clippy -p uart -- -D warnings
       - run: cargo clippy -p uart --target x86_64-pc-windows-msvc --tests -- -D warnings
-      - run: cargo clippy -p os-loader -- -D warnings
+
+  # Spelling in code, comments and docs; hardware terms it would flag are
+  # allowed in _typos.toml.
+  typos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@v1.52.0
